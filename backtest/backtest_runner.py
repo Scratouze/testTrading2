@@ -3,13 +3,10 @@ import logging
 from dataclasses import dataclass
 from typing import Optional, List, Literal, Dict, Any
 import pandas as pd
-import numpy as np
 from pathlib import Path
 import os
 
-from strategies.alpha_combo import StrategyConfig, AlphaComboStrategy
-
-Signal = Literal["BUY", "SELL", "HOLD"]
+from strategies.alpha_combo import StrategyConfig, AlphaComboStrategy, Signal
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,7 +24,7 @@ class BacktestConfig:
     timeframe: str = "1h"
 
     # Trading
-    risk_per_trade: float = 0.003   # 0.3% par trade
+    risk_per_trade: float = 0.005   # 0.5% par trade (un peu plus agressif)
     max_leverage: float = 1.0
     fees_bps: float = 6.0
     slippage_bps: float = 2.0
@@ -37,12 +34,12 @@ class BacktestConfig:
     end: Optional[str] = None
 
     # Source données
-    data_csv: Optional[str] = None  # si fourni, on le lit
+    data_csv: Optional[str] = None
     allow_short: bool = False
 
     # Anti-overtrading
-    cooldown_bars: int = 12
-    lockout_bars_after_loss: int = 12
+    cooldown_bars: int = 4
+    lockout_bars_after_loss: int = 6
 
 
 # =========================
@@ -50,36 +47,47 @@ class BacktestConfig:
 # =========================
 def _download_with_ccxt(csv_path: Path, symbol_ccxt: str = "BTC/USDT", timeframe: str = "1h", limit: int = 1500) -> pd.DataFrame:
     try:
-        import ccxt
+        import ccxt, time
     except Exception:
         raise RuntimeError("ccxt n'est pas installé. Fais:  pip install ccxt")
 
     os.makedirs(csv_path.parent, exist_ok=True)
-
     exchange = ccxt.binance({"enableRateLimit": True})
-    log.info(f"Téléchargement de {limit} bougies en {timeframe} pour {symbol_ccxt} depuis Binance (ccxt)")
-    ohlcv = exchange.fetch_ohlcv(symbol_ccxt, timeframe=timeframe, limit=limit)
 
-    if not ohlcv or len(ohlcv) == 0:
+    tf_ms = exchange.parse_timeframe(timeframe) * 1000
+    # 3 ans en arrière
+    since = int((pd.Timestamp.utcnow() - pd.Timedelta(days=365*3)).timestamp() * 1000)
+
+    log.info(f"Téléchargement paginé de bougies {timeframe} pour {symbol_ccxt} depuis ~3 ans (ccxt)")
+    all_rows = []
+    while True:
+        ohlcv = exchange.fetch_ohlcv(symbol_ccxt, timeframe=timeframe, since=since, limit=1000)
+        if not ohlcv:
+            break
+        all_rows += ohlcv
+        since = ohlcv[-1][0] + tf_ms
+        # petite pause anti-rate-limit
+        time.sleep(exchange.rateLimit / 1000)
+        # garde une marge pour éviter la boucle infinie
+        if len(all_rows) >= 26000:  # ≈ 3 ans de bougies 1h
+            break
+
+    if not all_rows:
         raise RuntimeError("Téléchargement vide depuis ccxt.")
 
-    df = pd.DataFrame(ohlcv, columns=["datetime_ms", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(all_rows, columns=["datetime_ms", "open", "high", "low", "close", "volume"])
     df["datetime"] = pd.to_datetime(df["datetime_ms"], unit="ms", utc=True)
-    df = df[["datetime", "open", "high", "low", "close", "volume"]]
-    df.to_csv(csv_path, index=False)
-    log.info(f"CSV enregistré: {csv_path.as_posix()}")
-    return df.set_index("datetime")
+    df = df.drop_duplicates(subset=["datetime"]).set_index("datetime").sort_index()
+    df = df[["open", "high", "low", "close", "volume"]]
+    df.to_csv(csv_path, index=True)  # garde l'index datetime en CSV
+    log.info(f"CSV enregistré: {csv_path.as_posix()} ({len(df)} lignes)")
+    return df
 
 
 # =========================
 # Chargement des données
 # =========================
 def load_candles(cfg: BacktestConfig) -> pd.DataFrame:
-    """
-    1) Si cfg.data_csv fourni -> lecture.
-    2) Sinon, cherche data/{symbol}_{timeframe}.csv
-    3) Sinon, télécharge via ccxt et crée le CSV automatiquement.
-    """
     if cfg.data_csv:
         path = Path(cfg.data_csv)
     else:
@@ -102,7 +110,6 @@ def load_candles(cfg: BacktestConfig) -> pd.DataFrame:
         df[time_col] = pd.to_datetime(df[time_col], utc=True, errors="coerce")
         df = df.dropna(subset=[time_col]).set_index(time_col).sort_index()
 
-    # uniformise colonnes
     df = df.rename(columns={c: c.lower() for c in df.columns})
     required = {"open", "high", "low", "close"}
     if not required.issubset(df.columns):
@@ -129,6 +136,8 @@ def fees_value(notional: float, bps: float) -> float:
 # =========================
 # Structures
 # =========================
+from dataclasses import dataclass
+
 @dataclass
 class Position:
     side: Signal
@@ -137,6 +146,7 @@ class Position:
     sl: float
     tp: float
     trail_trigger: float
+    be_trigger: float
     peak: float
     notional: float
 
@@ -191,11 +201,19 @@ class Backtester:
             row_prev = df.iloc[i-1]
             row = df.iloc[i]
 
-            # -------- SORTIE --------
+            # -------- SORTIE / GESTION --------
             if pos is not None:
                 atr = max(row["atr"], 1e-9)
 
-                # Mise à jour trailing
+                # Break-even: si 1R atteint, on remonte/descend le SL à l'entrée
+                if pos.side == "BUY":
+                    if row["high"] >= pos.be_trigger and pos.sl < pos.entry:
+                        pos.sl = pos.entry
+                else:
+                    if row["low"] <= pos.be_trigger and pos.sl > pos.entry:
+                        pos.sl = pos.entry
+
+                # Trailing dynamique après le trigger
                 if pos.side == "BUY":
                     pos.peak = max(pos.peak, row["high"])
                     if row["high"] >= pos.trail_trigger:
@@ -207,6 +225,7 @@ class Backtester:
                         new_sl = min(pos.sl, pos.peak + self.strat.cfg.trail_atr_mult * atr)
                         pos.sl = min(pos.sl, new_sl)
 
+                # Conditions de sortie
                 exit_reason = None
                 exit_price = None
                 if pos.side == "BUY":
@@ -224,7 +243,7 @@ class Backtester:
                         exit_reason = "TAKE PROFIT"
                         exit_price = pos.tp
 
-                # Reverse
+                # Reverse signal
                 if exit_reason is None and ((row["signal"] == "BUY" and pos.side == "SELL") or (row["signal"] == "SELL" and pos.side == "BUY")):
                     exit_reason = "REVERSE SIGNAL"
                     exit_price = row["close"]
@@ -270,14 +289,12 @@ class Backtester:
                 atr = max(row["atr"], 1e-9)
                 levels = self.strat.compute_levels(sig, float(row["close"]), atr)
 
-                if sig == "BUY":
-                    per_unit_risk = max((row["close"] - levels["sl"]), 1e-9)
-                else:
-                    per_unit_risk = max((levels["sl"] - row["close"]), 1e-9)
+                # risque par unité
+                per_unit_risk = (row["close"] - levels["sl"]) if sig == "BUY" else (levels["sl"] - row["close"])
+                per_unit_risk = max(float(per_unit_risk), 1e-9)
 
                 risk_budget = capital * self.bt_cfg.risk_per_trade
-                qty_raw = (risk_budget * self.bt_cfg.max_leverage) / per_unit_risk
-                qty = max(qty_raw, 0.0)
+                qty = max((risk_budget * self.bt_cfg.max_leverage) / per_unit_risk, 0.0)
                 if qty <= 0:
                     continue
 
@@ -286,6 +303,9 @@ class Backtester:
                 entry_fees = fees_value(notional_entry, self.bt_cfg.fees_bps)
                 capital -= entry_fees
 
+                # break-even trigger
+                be_trigger = self.strat.compute_be_trigger(sig, entry_px, levels["sl"])
+
                 pos = Position(
                     side=sig,
                     qty=qty,
@@ -293,12 +313,16 @@ class Backtester:
                     sl=levels["sl"],
                     tp=levels["tp"],
                     trail_trigger=levels["trail_trigger"],
+                    be_trigger=be_trigger,
                     peak=float(row["high"] if sig == "BUY" else row["low"]),
                     notional=notional_entry
                 )
                 last_entry_idx = i
 
-                log.info(f"[{t}] OUVERTURE {('LONG' if sig=='BUY' else 'SHORT')} @ {entry_px:.2f}, SL=@{pos.sl:.2f}, TP=@{pos.tp:.2f} | qty={qty:.6f} BTC")
+                log.info(
+                    f"[{t}] OUVERTURE {('LONG' if sig=='BUY' else 'SHORT')} @ {entry_px:.2f}, SL=@{pos.sl:.2f}, "
+                    f"TP=@{pos.tp:.2f} | BE trigger @{pos.be_trigger:.2f} | qty={qty:.6f} BTC"
+                )
 
         # Stats
         pnl_list = [tr.pnl for tr in trades]
@@ -333,39 +357,39 @@ def main():
     bt_cfg = BacktestConfig(
         symbol="BTCUSDT",
         timeframe="1h",
-        risk_per_trade=0.003,   # 0.3% par trade
+        risk_per_trade=0.005,   # 0.5% par trade
         max_leverage=1.0,
         fees_bps=6.0,
         slippage_bps=2.0,
-        data_csv=None,          # laisse vide pour auto-télécharger via ccxt si besoin
-        allow_short=False,      # coupe les shorts
+        data_csv=None,
+        allow_short=True,      # tu peux essayer True plus tard
         start=None,
         end=None,
-        cooldown_bars=12,
-        lockout_bars_after_loss=12,
+        cooldown_bars=8,
+        lockout_bars_after_loss=10,
     )
 
     strat_cfg = StrategyConfig(
         ema_fast=21,
         ema_slow=55,
         rsi_len=14,
-        rsi_buy=62,
-        rsi_sell=38,
+        rsi_buy=55.0,
+        rsi_sell=45.0,
         trend_sma=200,
         atr_len=14,
-        atr_mult_sl=3.0,
-        atr_mult_tp=4.5,
-        trail_atr_mult=1.5,
+        atr_mult_sl=2.2,
+        atr_mult_tp=3.2,
+        trail_atr_mult=1.3,
         min_bars=300,
         adx_len=14,
-        adx_min=27.0,
-        be_rr=1.0,
+        adx_min=18.0,
+        be_rr=1.0,              # break-even à 1R
         slope_lookback=5,
-        trade_start_hour=13,
-        trade_end_hour=22,
-        avoid_weekends=True,
+        trade_start_hour=0,
+        trade_end_hour=23,
+        avoid_weekends=False,
         atrp_window=200,
-        atrp_min_quantile=0.35,
+        atrp_min_quantile=0.25,
     )
 
     try:
