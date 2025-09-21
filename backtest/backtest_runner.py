@@ -1,13 +1,13 @@
 # backtest/backtest_runner.py
 import logging
 from dataclasses import dataclass
-from typing import Optional, List, Literal, Dict
+from typing import Optional, List, Literal, Dict, Any
 import pandas as pd
 import numpy as np
 from pathlib import Path
 import os
 
-from strategies.alpha_combo import AlphaComboStrategy, StrategyConfig
+from strategies.alpha_combo import StrategyConfig, AlphaComboStrategy
 
 Signal = Literal["BUY", "SELL", "HOLD"]
 
@@ -23,11 +23,11 @@ log = logging.getLogger(__name__)
 # =========================
 @dataclass
 class BacktestConfig:
-    symbol: str = "BTCUSDT"     # pour nommage fichiers
+    symbol: str = "BTCUSDT"
     timeframe: str = "1h"
 
     # Trading
-    risk_per_trade: float = 0.01
+    risk_per_trade: float = 0.003   # 0.3% par trade
     max_leverage: float = 1.0
     fees_bps: float = 6.0
     slippage_bps: float = 2.0
@@ -37,17 +37,18 @@ class BacktestConfig:
     end: Optional[str] = None
 
     # Source données
-    data_csv: Optional[str] = None  # si fourni, on le lit tel quel
+    data_csv: Optional[str] = None  # si fourni, on le lit
     allow_short: bool = False
+
+    # Anti-overtrading
+    cooldown_bars: int = 12
+    lockout_bars_after_loss: int = 12
 
 
 # =========================
 # Téléchargement via ccxt (fallback)
 # =========================
 def _download_with_ccxt(csv_path: Path, symbol_ccxt: str = "BTC/USDT", timeframe: str = "1h", limit: int = 1500) -> pd.DataFrame:
-    """
-    Télécharge des bougies spot Binance via ccxt et sauvegarde en CSV.
-    """
     try:
         import ccxt
     except Exception:
@@ -85,8 +86,6 @@ def load_candles(cfg: BacktestConfig) -> pd.DataFrame:
         path = Path("data") / f"{cfg.symbol}_{cfg.timeframe}.csv"
 
     if not path.exists():
-        # fallback téléchargement ccxt
-        # Map timeframe pour ccxt (nos noms sont compatibles: '1h')
         symbol_ccxt = "BTC/USDT" if cfg.symbol.upper() == "BTCUSDT" else cfg.symbol.replace("USDT", "/USDT")
         df = _download_with_ccxt(path, symbol_ccxt=symbol_ccxt, timeframe=cfg.timeframe, limit=1500)
     else:
@@ -123,13 +122,12 @@ def apply_slippage(price: float, bps: float, side: Signal, direction: str) -> fl
     else:
         return price * (inv_mult if side == "BUY" else mult)
 
-
 def fees_value(notional: float, bps: float) -> float:
     return abs(notional) * (bps / 10000.0)
 
 
 # =========================
-# Backtest
+# Structures
 # =========================
 @dataclass
 class Position:
@@ -141,7 +139,6 @@ class Position:
     trail_trigger: float
     peak: float
     notional: float
-
 
 @dataclass
 class TradeResult:
@@ -155,21 +152,38 @@ class TradeResult:
     reason: str
 
 
+# =========================
+# Backtester
+# =========================
 class Backtester:
     def __init__(self, bt_cfg: BacktestConfig, strat_cfg: Optional[StrategyConfig] = None):
         self.bt_cfg = bt_cfg
         self.strat = AlphaComboStrategy(strat_cfg)
 
-    def run(self, candles: pd.DataFrame, initial_capital: float = 1000.0) -> Dict[str, any]:
+    def run(self, candles: pd.DataFrame, initial_capital: float = 1000.0) -> Dict[str, Any]:
         df = self.strat.generate_signals(candles).copy()
         if self.bt_cfg.start:
             df = df[df.index >= pd.to_datetime(self.bt_cfg.start, utc=True)]
         if self.bt_cfg.end:
             df = df[df.index <= pd.to_datetime(self.bt_cfg.end, utc=True)]
+        if len(df) == 0:
+            log.info("Pas de données après filtres (période/min_bars).")
+            return {
+                "initial_capital": initial_capital,
+                "final_capital": initial_capital,
+                "net_profit": 0.0,
+                "trades": [],
+                "wins": 0,
+                "losses": 0,
+                "hit_rate": 0.0,
+                "max_drawdown": 0.0,
+            }
 
         capital = float(initial_capital)
         pos: Optional[Position] = None
         trades: List[TradeResult] = []
+        last_entry_idx: Optional[int] = None
+        next_allowed_idx: int = 0  # lockout après perte
 
         for i in range(1, len(df)):
             t_prev = df.index[i-1]
@@ -177,9 +191,11 @@ class Backtester:
             row_prev = df.iloc[i-1]
             row = df.iloc[i]
 
-            # sortie
+            # -------- SORTIE --------
             if pos is not None:
                 atr = max(row["atr"], 1e-9)
+
+                # Mise à jour trailing
                 if pos.side == "BUY":
                     pos.peak = max(pos.peak, row["high"])
                     if row["high"] >= pos.trail_trigger:
@@ -208,6 +224,7 @@ class Backtester:
                         exit_reason = "TAKE PROFIT"
                         exit_price = pos.tp
 
+                # Reverse
                 if exit_reason is None and ((row["signal"] == "BUY" and pos.side == "SELL") or (row["signal"] == "SELL" and pos.side == "BUY")):
                     exit_reason = "REVERSE SIGNAL"
                     exit_price = row["close"]
@@ -224,45 +241,66 @@ class Backtester:
                         qty=pos.qty, pnl=pnl, reason=exit_reason
                     ))
                     capital += pnl
+
+                    # Lockout si perte
+                    if pnl < 0:
+                        next_allowed_idx = i + self.bt_cfg.lockout_bars_after_loss
+
                     log.info(f"[{t}] {exit_reason} @ {raw_exit:.2f} | qty={pos.qty:.6f} | PnL: {pnl:.2f} USDT")
                     pos = None
 
-            # entrée
+            # -------- ENTRÉE --------
             if pos is None:
+                # Cooldown & lockout
+                if i < next_allowed_idx:
+                    continue
+                if last_entry_idx is not None and (i - last_entry_idx) < self.bt_cfg.cooldown_bars:
+                    continue
+
                 sig: Signal = df.iat[i, df.columns.get_loc("signal")]
-                if sig in ("BUY", "SELL") and (sig == "BUY" or self.bt_cfg.allow_short):
-                    atr = max(row["atr"], 1e-9)
-                    levels = self.strat.compute_levels(sig, float(row["close"]), atr)
+                if sig not in ("BUY", "SELL"):
+                    continue
+                if sig == "SELL" and not self.bt_cfg.allow_short:
+                    continue
 
-                    if sig == "BUY":
-                        per_unit_risk = max((row["close"] - levels["sl"]), 1e-9)
-                    else:
-                        per_unit_risk = max((levels["sl"] - row["close"]), 1e-9)
+                # Filtre "tradable" (heures/volatilité)
+                if "tradable" in df.columns and not bool(row.get("tradable", True)):
+                    continue
 
-                    risk_budget = capital * self.bt_cfg.risk_per_trade
-                    qty_raw = (risk_budget * self.bt_cfg.max_leverage) / per_unit_risk
-                    qty = max(qty_raw, 0.0)
-                    if qty <= 0:
-                        continue
+                atr = max(row["atr"], 1e-9)
+                levels = self.strat.compute_levels(sig, float(row["close"]), atr)
 
-                    entry_px = apply_slippage(float(row["close"]), self.bt_cfg.slippage_bps, sig, "entry")
-                    notional_entry = entry_px * qty
-                    entry_fees = fees_value(notional_entry, self.bt_cfg.fees_bps)
-                    capital -= entry_fees
+                if sig == "BUY":
+                    per_unit_risk = max((row["close"] - levels["sl"]), 1e-9)
+                else:
+                    per_unit_risk = max((levels["sl"] - row["close"]), 1e-9)
 
-                    pos = Position(
-                        side=sig,
-                        qty=qty,
-                        entry=entry_px,
-                        sl=levels["sl"],
-                        tp=levels["tp"],
-                        trail_trigger=levels["trail_trigger"],
-                        peak=float(row["high"] if sig == "BUY" else row["low"]),
-                        notional=notional_entry
-                    )
+                risk_budget = capital * self.bt_cfg.risk_per_trade
+                qty_raw = (risk_budget * self.bt_cfg.max_leverage) / per_unit_risk
+                qty = max(qty_raw, 0.0)
+                if qty <= 0:
+                    continue
 
-                    log.info(f"[{t}] OUVERTURE {('LONG' if sig=='BUY' else 'SHORT')} @ {entry_px:.2f}, SL=@{pos.sl:.2f}, TP=@{pos.tp:.2f} | qty={qty:.6f} BTC")
+                entry_px = apply_slippage(float(row["close"]), self.bt_cfg.slippage_bps, sig, "entry")
+                notional_entry = entry_px * qty
+                entry_fees = fees_value(notional_entry, self.bt_cfg.fees_bps)
+                capital -= entry_fees
 
+                pos = Position(
+                    side=sig,
+                    qty=qty,
+                    entry=entry_px,
+                    sl=levels["sl"],
+                    tp=levels["tp"],
+                    trail_trigger=levels["trail_trigger"],
+                    peak=float(row["high"] if sig == "BUY" else row["low"]),
+                    notional=notional_entry
+                )
+                last_entry_idx = i
+
+                log.info(f"[{t}] OUVERTURE {('LONG' if sig=='BUY' else 'SHORT')} @ {entry_px:.2f}, SL=@{pos.sl:.2f}, TP=@{pos.tp:.2f} | qty={qty:.6f} BTC")
+
+        # Stats
         pnl_list = [tr.pnl for tr in trades]
         wins = sum(1 for p in pnl_list if p > 0)
         losses = sum(1 for p in pnl_list if p < 0)
@@ -295,23 +333,39 @@ def main():
     bt_cfg = BacktestConfig(
         symbol="BTCUSDT",
         timeframe="1h",
-        risk_per_trade=0.01,
+        risk_per_trade=0.003,   # 0.3% par trade
         max_leverage=1.0,
         fees_bps=6.0,
         slippage_bps=2.0,
-        data_csv=None,
-        allow_short=False,
+        data_csv=None,          # laisse vide pour auto-télécharger via ccxt si besoin
+        allow_short=False,      # coupe les shorts
         start=None,
         end=None,
+        cooldown_bars=12,
+        lockout_bars_after_loss=12,
     )
 
     strat_cfg = StrategyConfig(
-        ema_fast=21, ema_slow=55,
-        rsi_len=14, rsi_buy=55, rsi_sell=45,
+        ema_fast=21,
+        ema_slow=55,
+        rsi_len=14,
+        rsi_buy=62,
+        rsi_sell=38,
         trend_sma=200,
-        atr_len=14, atr_mult_sl=2.0, atr_mult_tp=3.0,
+        atr_len=14,
+        atr_mult_sl=3.0,
+        atr_mult_tp=4.5,
         trail_atr_mult=1.5,
-        min_bars=250,
+        min_bars=300,
+        adx_len=14,
+        adx_min=27.0,
+        be_rr=1.0,
+        slope_lookback=5,
+        trade_start_hour=13,
+        trade_end_hour=22,
+        avoid_weekends=True,
+        atrp_window=200,
+        atrp_min_quantile=0.35,
     )
 
     try:
