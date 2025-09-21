@@ -18,10 +18,24 @@ class Config:
 
     # --- Trading ---
     TRADING_PAIR = os.getenv("TRADING_PAIR", "BTCUSDT")
-    RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", 0.02))  # 2% du capital
-    STOP_LOSS = float(os.getenv("STOP_LOSS", 0.02))            # 2% de perte max
-    TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", 0.04))        # 4% de gain
-    MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", 0.10))      # -10% capital
+
+    # Risque par trade (ex: 0.02 = 2% du capital)
+    RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", 0.02))
+
+    # Stop & Take Profit exprimés en POURCENTAGE (ex: 0.005 = 0,5%)
+    STOP_LOSS = float(os.getenv("STOP_LOSS", 0.005))         # 0.5%
+    TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", 0.01))      # 1.0%
+
+    # Trailing stop (ex: 0.003 = 0,3%) — suivi uniquement en gains
+    TRAILING_STOP = float(os.getenv("TRAILING_STOP", 0.003))
+
+    # Drawdown maximal (non utilisé pour bloquer encore, mais dispo)
+    MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", 0.10))    # -10% capital
+
+    # --- Backtest ---
+    INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", 1000.0))
+    HISTORICAL_LIMIT = int(os.getenv("HISTORICAL_LIMIT", 1500))
+    INTERVAL = os.getenv("INTERVAL", "1h")
 
     # --- Divers ---
     LOG_DIR = Path("logs")
@@ -42,6 +56,10 @@ class Config:
             "RISK_PER_TRADE": cls.RISK_PER_TRADE,
             "STOP_LOSS": cls.STOP_LOSS,
             "TAKE_PROFIT": cls.TAKE_PROFIT,
+            "TRAILING_STOP": cls.TRAILING_STOP,
             "MAX_DRAWDOWN": cls.MAX_DRAWDOWN,
-            "BINANCE_TESTNET": cls.BINANCE_TESTNET
+            "BINANCE_TESTNET": cls.BINANCE_TESTNET,
+            "INITIAL_BALANCE": cls.INITIAL_BALANCE,
+            "HISTORICAL_LIMIT": cls.HISTORICAL_LIMIT,
+            "INTERVAL": cls.INTERVAL,
         }

@@ -6,8 +6,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 import matplotlib.pyplot as plt
-from core.binance_client import BinanceClient
 from config import Config
+from core.binance_client import BinanceClient
 from strategies.sma_rsi_macd import StrategySmaRsiMacd
 from core.logger import logger
 
@@ -40,15 +40,17 @@ class BacktestRunner:
 
         return df[["time", "open", "high", "low", "close", "volume"]]
 
-    # backtest/backtest_runner.py
-
     def simulate_backtest(self, df):
+        """
+        Simule les trades sur le DataFrame donné, avec Stop Loss & Take Profit
+        """
         df = self.strategy._add_indicators(df)
 
         position = None
-        entry_price = 0
+        entry_price = None
         stop_loss_price = None
         take_profit_price = None
+
         balance_history = []
         time_history = []
 
@@ -60,63 +62,70 @@ class BacktestRunner:
             current_low = df.iloc[i]["low"]
             current_time = df.iloc[i]["time"]
 
-            partial_df = df.iloc[:i + 1]
+            partial_df = df.iloc[:i+1]
             signal_data = self.strategy.generate_signal(partial_df)
             signal = signal_data["action"]
 
-            # Skip si indicateurs pas prêts
+            logger.info(f"[{current_time}] Signal: {signal} | Prix: {current_price:.2f}")
+
+            # Ignorer si indicateurs pas encore calculés
             if signal_data["reason"].startswith("Indicateurs non calculés"):
+                # Toujours enregistrer le capital même s'il n'y a pas de position
+                balance_history.append(self.current_balance)
+                time_history.append(current_time)
                 continue
 
             # Si pas de position ouverte et signal BUY
             if position is None and signal == "BUY":
                 position = "LONG"
                 entry_price = current_price
-                # définir SL et TP à partir de l'entrée
+                # définir Stop Loss & Take Profit
                 stop_loss_price = entry_price * (1 - Config.STOP_LOSS)
                 take_profit_price = entry_price * (1 + Config.TAKE_PROFIT)
                 logger.info(
-                    f"[{current_time}] OUVERTURE LONG @ {entry_price:.2f}, SL=@{stop_loss_price:.2f}, TP=@{take_profit_price:.2f}")
+                    f"[{current_time}] OUVERTURE LONG @ {entry_price:.2f}, SL=@{stop_loss_price:.2f}, TP=@{take_profit_price:.2f}"
+                )
 
-            # Si position ouverte, vérifier SL/TP
+            # Si position ouverte, vérifier SL/TP & signal SELL
             elif position == "LONG":
-                # d’abord vérifier si TP atteint
+                # Vérifier TP atteint
                 if current_high >= take_profit_price:
                     profit = take_profit_price - entry_price
                     self.current_balance += profit
                     self.trades.append(profit)
-                    logger.info(
-                        f"[{current_time}] TAKE PROFIT atteint @ {take_profit_price:.2f} | Profit: {profit:.2f}")
+                    logger.info(f"[{current_time}] TAKE PROFIT atteint @ {take_profit_price:.2f} | Profit: {profit:.2f}")
                     position = None
-                    # reset SL/TP
+                    entry_price = None
                     stop_loss_price = None
                     take_profit_price = None
 
-                # sinon vérifier SL
+                # Sinon vérifier SL
                 elif current_low <= stop_loss_price:
                     profit = stop_loss_price - entry_price
                     self.current_balance += profit
                     self.trades.append(profit)
                     logger.info(f"[{current_time}] STOP LOSS atteint @ {stop_loss_price:.2f} | Perte: {profit:.2f}")
                     position = None
+                    entry_price = None
                     stop_loss_price = None
                     take_profit_price = None
 
-                # sinon vérifier signal SELL pour sortir
+                # Sinon signal SELL
                 elif signal == "SELL":
                     profit = current_price - entry_price
                     self.current_balance += profit
                     self.trades.append(profit)
                     logger.info(f"[{current_time}] SIGNAL SELL @ {current_price:.2f} | Profit: {profit:.2f}")
                     position = None
+                    entry_price = None
                     stop_loss_price = None
                     take_profit_price = None
 
-            # Toujours enregistrer le capital et le temps pour courbe
+            # Enregistrer capital & temps chaque bougie
             balance_history.append(self.current_balance)
             time_history.append(current_time)
 
-        # Si position encore ouverte à la fin, la clore
+        # Clôturer la position si elle est encore ouverte à la fin
         if position == "LONG" and entry_price is not None:
             profit = df.iloc[-1]["close"] - entry_price
             self.current_balance += profit
@@ -127,7 +136,7 @@ class BacktestRunner:
 
     def run(self, limit=1000, interval="1h"):
         """
-        Lance un backtest complet
+        Lance un backtest complet avec paramètres donnés
         """
         df = self.fetch_historical_data(limit=limit, interval=interval)
         time_history, balance_history = self.simulate_backtest(df)
@@ -146,13 +155,12 @@ class BacktestRunner:
         logger.info(f"Trades perdants : {loss_trades}")
         logger.info(f"Taux de réussite : {win_rate:.2f}%")
 
-        # Affichage graphique
         if len(time_history) > 0:
             plt.figure(figsize=(12, 6))
             plt.plot(time_history, balance_history, label="Évolution du capital", color="blue")
             plt.xlabel("Temps")
             plt.ylabel("Capital (USDT)")
-            plt.title("Courbe du capital - Backtest")
+            plt.title("Courbe du capital - Backtest avec SL/TP")
             plt.legend()
             plt.grid()
             plt.show()
@@ -162,4 +170,5 @@ class BacktestRunner:
 
 if __name__ == "__main__":
     backtest = BacktestRunner(starting_balance=1000)
+    # tu peux ajuster limit/interval si besoin
     backtest.run(limit=1500, interval="1h")
