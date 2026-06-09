@@ -1,673 +1,647 @@
 """
-ppt_render.py — Conversion d'un diaporama PowerPoint en page web locale.
+main.py — Point d'entrée de Kiosk Engine.
 
-Pourquoi ce module ?
-    PowerPoint est mono-instance et ne joue qu'un seul diaporama à la fois. Il est
-    donc impossible d'afficher un même .pptx (ou des .pptx différents) en "live" sur
-    plusieurs écrans simultanément. On contourne cette limite en exportant les diapos
-    en images — via le PowerPoint déjà installé sur le poste, en COM, sans accès
-    réseau — puis en générant une page HTML autonome qui les fait défiler en plein
-    écran. Cette page est ensuite affichée par le moteur via le chemin Chrome par
-    moniteur, qui gère déjà parfaitement le multi-écran (un Chrome --kiosk par écran).
+Usage:
+    python main.py [base_dir] [--autorun config.json] [--site X] [--workspace Y]
 
-Minutage des diapos (par ordre de priorité) :
-    1. durée/diapo explicite fournie par l'appelant → uniforme, prioritaire ;
-    2. sinon, minutages d'avancement automatique présents dans le .pptx → respectés ;
-    3. sinon → durée par défaut uniforme (fallback_slide_s).
-    La durée d'affichage totale de l'élément = durée d'un cycle complet × nb de boucles.
-
-Mise en cache :
-    La clé de cache combine le chemin absolu, la date de modification, la taille du
-    .pptx ET la durée/diapo (qui est figée dans le HTML). Une conversion est donc
-    réalisée une fois par (fichier, durée/diapo), refaite seulement si l'un change.
-
-API publique :
-    render_ppt_to_web(pptx_path, duree_diapo, boucles, fallback_slide_s, cache_root,
-                      force) -> Optional[dict]
-        Retourne {"html": <chemin absolu>, "duree_totale_s": <int>} (à utiliser en
-        source "file:///...") ou None en cas d'échec (repli géré par l'appelant).
+Pipeline de démarrage :
+    1. Parse CLI + init DPI + logger
+    2. Résolution scope RBAC (user → role, site, workspace)
+    3. Sélection config (autorun ou sélecteur)
+    4. Validation Pydantic + compilation (résolution skills + fusion playlist)
+    5. Validation sécurité (domaines, exec, send_keys)
+    6. Splash + bannière + threads moniteurs + control panel
 """
 
+import sys
 import os
-import json
-import shutil
-import hashlib
-import base64
-from typing import Optional, Callable
+import time
+import tkinter as tk
+import subprocess
+import threading
+import ctypes
+import socket
 
 from loguru import logger
 
+import sys
+import os
+import ctypes
+import tkinter as tk
+from tkinter import messagebox
 
-# ── Constantes de module ──────────────────────────────────────────────
-_IMG_FILTER = "PNG"                 # filtre graphique PowerPoint
-_IMG_EXT = "png"
-_EXPORT_LONG_EDGE_PX = 1920         # bord long de l'image exportée (aspect préservé)
-_CROSSFADE_MS = 600                 # durée du fondu enchaîné entre 2 diapos
-_MIN_SLIDE_MS = 1000                # plancher de durée par diapo (anti-clignotement)
-_DEFAULT_SLIDE_S = 8                # durée/diapo par défaut (ni durée fixée, ni minutage)
-_CACHE_DIR_NAME = "PptCache"        # sous %LOCALAPPDATA%/KioskEngine/
-_OFFICE_VERSIONS = ("16.0", "15.0", "14.0")  # versions Office candidates (LTSC = 16.0)
-_DONE_MARKER = ".render_done"       # marqueur de cache complet (anti-cache partiel)
-_META_FILENAME = "meta.json"
-_HTML_FILENAME = "show.html"
-_CACHE_KEY_LEN = 16
-_RENDER_VERSION = 3                 # bumper à chaque changement de rendu → invalide les caches
-
-
-# ── Hook de progression (optionnel) ───────────────────────────────────
-# Permet à l'appelant (ex. le splash de démarrage) d'afficher l'avancement de la
-# conversion. Reste None par défaut : aucun impact si personne ne le branche.
-_PROGRESS_CB: Optional[Callable[[str, Optional[float]], None]] = None
-
-
-def set_progress_callback(callback: Optional[Callable[[str, Optional[float]], None]]) -> None:
-    """Branche (ou débranche avec None) un callback de progression de conversion.
-
-    Le callback reçoit (message: str, fraction: Optional[float]). 'fraction' vaut
-    la progression intra-présentation (0.0→1.0) quand elle est connue, sinon None.
+def _appliquer_securites_demarrage(base_dir: str):
     """
-    global _PROGRESS_CB
-    _PROGRESS_CB = callback
-
-
-def _report(message: str, fraction: Optional[float] = None) -> None:
-    """Notifie la progression si un callback est branché. Ne casse jamais la conversion."""
-    if _PROGRESS_CB is None:
+    Applique les 3 barrières de sécurité indispensables avant le démarrage :
+    1. Anti-doublon (Mutex)
+    2. Verrou d'emplacement
+    3. Disponibilité du serveur
+    """
+    # On ignore ces blocages si on lance le script en mode développeur (.py)
+    if not getattr(sys, 'frozen', False):
         return
-    try:
-        _PROGRESS_CB(message, fraction)
-    except Exception as e:  # le reporting ne doit jamais faire échouer le rendu
-        logger.debug(f"[PPT→Web] Callback de progression ignoré : {e}")
+
+    mutex_name = "Global\\KioskEngine_App_Mutex_Lock"
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW(None, False, mutex_name)
+    if kernel32.GetLastError() == 183:
+        sys.exit(0)
+
+
+    chemin_actuel = os.path.abspath(sys.executable).lower()
+    dossier_attendu = os.path.join(os.getenv('LOCALAPPDATA'), "KioskEngine_App")
+    chemin_attendu = os.path.join(dossier_attendu, "KioskEngine.exe").lower()
+
+    if chemin_actuel != chemin_attendu:
+        _afficher_erreur_critique(
+            "Lancement non autorisé",
+            "Le Kiosk Engine ne peut pas être exécuté depuis cet emplacement.\n"
+            "Veuillez utiliser le script de démarrage officiel.\n\n"
+            f"Chemin actuel : {chemin_actuel}"
+        )
+
+    if not os.path.exists(base_dir):
+        _afficher_erreur_critique(
+            "Panne Réseau",
+            "Impossible de joindre le serveur principal.\n"
+            "Vérifiez votre connexion réseau (ou le VPN) avant de relancer l'application.\n\n"
+            f"Chemin inaccessible : {base_dir}"
+        )
+
+def _afficher_erreur_critique(titre: str, message: str):
+    """Affiche une popup d'erreur native et tue le processus."""
+    root = tk.Tk()
+    root.withdraw()  # Masque la fenêtre grise vide derrière la popup
+    root.attributes("-topmost", True)  # Force la popup au premier plan
+    messagebox.showerror(titre, message)
+    sys.exit(1)
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    pass
+
+try:
+    myappid = 'airbus.kioskengine.app.1.0'
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+except Exception:
+    pass
+
+import state
+import config as cfg
+from security import validate_config
+from managers import process_manager
+from controllers import InstanceTracker
+from engine import thread_moniteur
+from compiler import compile_config, CompilationError
+
+from ui import (
+    ConfigSelectorView,
+    SplashScreenView,
+    AppBannerView,
+    ControlPanelView,
+    is_admin_open,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# API publique
+# REDÉMARRAGE / ARRÊT
 # ══════════════════════════════════════════════════════════════════════
 
-def render_ppt_to_web(pptx_path: str, duree_diapo: Optional[int] = None,
-                      boucles: int = 1, fallback_slide_s: int = _DEFAULT_SLIDE_S,
-                      cache_root: Optional[str] = None,
-                      force: bool = False) -> Optional[dict]:
-    """Convertit (avec cache) un .pptx en page web locale de diapos défilantes.
+def restart_app(new_config: str | None = None, clear_profile: bool = False, index: int | None = None):
+    """Prépare l'arrêt pour laisser le script .bat faire la mise à jour, ou s'auto-relance en dev."""
+    logger.info("Ordre de REDÉMARRAGE initié...")
+    state.shutdown_event.set()
 
-    Args:
-        pptx_path: Chemin du .pptx source (local ou partage UNC).
-        duree_diapo: Durée fixe par diapo en secondes. Si fournie (> 0), elle est
-            PRIORITAIRE. Sinon on respecte les minutages du fichier, sinon un défaut.
-        boucles: Nombre de fois où le diaporama défile avant de passer à l'élément
-            suivant (sert à calculer la durée d'affichage totale).
-        fallback_slide_s: Durée/diapo par défaut (ni durée fixée, ni minutage natif).
-        cache_root: Racine du cache (défaut %LOCALAPPDATA%/KioskEngine/PptCache).
-        force: Si True, ignore le cache et reconvertit.
-
-    Returns:
-        {"html": <chemin absolu>, "duree_totale_s": <int>} ou None en cas d'échec.
-        duree_totale_s = durée d'un cycle complet × boucles.
-    """
-    if not pptx_path or not os.path.isfile(pptx_path):
-        logger.error(f"[PPT→Web] Fichier introuvable : {pptx_path}")
-        return None
-
-    boucles = max(1, int(boucles or 1))
-    cache_root = _resolve_cache_root(cache_root)
-
-    try:
-        cache_key = _cache_key(pptx_path, duree_diapo)
-    except OSError as e:
-        logger.error(f"[PPT→Web] Accès impossible à {pptx_path} : {e}")
-        return None
-
-    out_dir = os.path.join(cache_root, cache_key)
-    html_path = os.path.join(out_dir, _HTML_FILENAME)
-    done_marker = os.path.join(out_dir, _DONE_MARKER)
-
-    # Cache valide : on réutilise directement (on relit le minutage pour la durée).
-    if not force and os.path.isfile(done_marker) and os.path.isfile(html_path):
-        slides_meta = _read_meta_slides(out_dir)
-        if slides_meta is not None:
-            logger.debug(f"[PPT→Web] Cache réutilisé pour '{os.path.basename(pptx_path)}'")
-            return {"html": html_path, "duree_totale_s": _total_seconds(slides_meta, boucles)}
-
-    return _convert(pptx_path, duree_diapo, boucles, fallback_slide_s,
-                    out_dir, html_path, done_marker)
-
-
-# ══════════════════════════════════════════════════════════════════════
-# Implémentation interne
-# ══════════════════════════════════════════════════════════════════════
-
-def _convert(pptx_path: str, duree_diapo: Optional[int], boucles: int,
-             fallback_slide_s: int, out_dir: str, html_path: str,
-             done_marker: str) -> Optional[dict]:
-    """Orchestration : export images + minutage + génération HTML.
-
-    Retourne {"html", "duree_totale_s"} ou None en cas d'échec.
-    """
-    staged = None
-    try:
-        # On repart d'un dossier propre pour éviter des diapos obsolètes en cache.
-        if os.path.isdir(out_dir):
-            shutil.rmtree(out_dir, ignore_errors=True)
-        os.makedirs(out_dir, exist_ok=True)
-
-        logger.info(f"[PPT→Web] Conversion de '{os.path.basename(pptx_path)}'...")
-        _report(f"Conversion de « {os.path.basename(pptx_path)} »...", None)
-        staged = _stage_in_trusted_dir(pptx_path)  # copie locale approuvée (contourne le File Block)
-        slides_meta = _export_slides_com(staged or pptx_path, out_dir)
-        if not slides_meta:
-            logger.error(f"[PPT→Web] Aucune diapo exportée pour {pptx_path}")
-            return None
-
-        slides_meta = _apply_slide_durations(slides_meta, duree_diapo, fallback_slide_s)
-
-        _atomic_write_text(html_path, _build_show_html(slides_meta, out_dir))
-        _write_meta(out_dir, pptx_path, slides_meta)
-
-        # Marqueur écrit en dernier : sa présence garantit un cache complet.
-        with open(done_marker, "w", encoding="utf-8") as marker:
-            marker.write("ok")
-
-        logger.info(f"[PPT→Web] {len(slides_meta)} diapo(s) prêtes : {html_path}")
-        return {"html": html_path, "duree_totale_s": _total_seconds(slides_meta, boucles)}
-
-    except Exception as e:
-        logger.error(f"[PPT→Web] Échec conversion '{pptx_path}' : {e}")
-        return None
-    finally:
-        # La copie locale n'est plus utile une fois les diapos exportées.
-        if staged and os.path.isfile(staged):
-            try:
-                os.remove(staged)
-            except OSError:
-                pass
-
-
-def _export_slides_com(pptx_path: str, out_dir: str) -> list[dict]:
-    """Convertit le .pptx en PNG via PDF (moteur PDF de PowerPoint + PyMuPDF).
-
-    Pourquoi pas Slide.Export ? Le moteur d'IMAGES de PowerPoint est neutralisé sur les
-    postes Office verrouillés (export silencieusement sans effet). Le moteur PDF
-    (ExportAsFixedFormat, = « Enregistrer au format PDF ») reste, lui, fiable et
-    indépendant du rendu écran. On exporte donc le deck en PDF, puis PyMuPDF (paquet
-    Python, pas d'exe → hors AppLocker) rend chaque page en PNG.
-
-    L'import de pywin32 (pythoncom / win32com.client) est fait *à l'intérieur* de la
-    fonction afin que le module reste importable hors Windows (tests, CI).
-    """
-    import pythoncom
-    import win32com.client.dynamic
-
-    pdf_path = os.path.join(out_dir, "_deck.pdf")
-    pythoncom.CoInitialize()
-    powerpoint = None
-    presentation = None
-    previous_security = None
-    try:
-        # Liaison TARDIVE forcée (dynamic.Dispatch) : évite les wrappers gen_py, dont les
-        # arguments optionnels (sentinelles) cassent SaveAs/ExportAsFixedFormat avec
-        # « Python instance can not be converted to a COM object ».
-        logger.debug("[PPT→Web] COM : démarrage de PowerPoint (liaison tardive)...")
-        _report("Ouverture de PowerPoint...", None)
-        powerpoint = win32com.client.dynamic.Dispatch("PowerPoint.Application")
+    # --- 1. SAUVEGARDE DE LA NOUVELLE CONFIG (Transmission au .bat / prochain lancement) ---
+    config_to_run = new_config or getattr(state, 'active_config_path', state.active_config_name)
+    if config_to_run:
+        appdata_dir = os.getenv('LOCALAPPDATA')
+        autorun_file = os.path.join(appdata_dir, "KioskEngine_App", "next_autorun.txt")
+        os.makedirs(os.path.dirname(autorun_file), exist_ok=True)
         try:
-            previous_security = powerpoint.AutomationSecurity
-            powerpoint.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
-        except Exception:
-            previous_security = None
+            with open(autorun_file, "w", encoding="utf-8") as f:
+                f.write(config_to_run)
+            logger.info(f"Fichier next_autorun.txt écrit avec succès : {config_to_run}")
+        except Exception as e:
+            logger.error(f"Erreur lors de l'écriture de next_autorun.txt : {e}")
+
+    # --- 2. NETTOYAGE DES PROCESSUS ---
+    import time
+    time.sleep(1.0)
+    from managers import process_manager
+    process_manager.kill_all_tracked()
+
+    if clear_profile:
+        import shutil
+        appdata_dir = os.getenv('LOCALAPPDATA')
+        profile_base_dir = os.path.join(appdata_dir, "KioskEngine")
         try:
-            powerpoint.DisplayAlerts = 1  # ppAlertsNone : aucun dialogue pendant l'automatisation
+            time.sleep(1)
+            shutil.rmtree(profile_base_dir, ignore_errors=True)
+            logger.info("🧹 Profil Chrome nettoyé !")
         except Exception:
             pass
-        # L'export PDF ne dépend pas d'une fenêtre de rendu → WithWindow=False (rien à l'écran).
-        logger.debug("[PPT→Web] COM : ouverture du deck...")
-        presentation = powerpoint.Presentations.Open(
-            os.path.abspath(pptx_path), ReadOnly=True, Untitled=False, WithWindow=False
-        )
-        logger.debug(f"[PPT→Web] COM : {presentation.Slides.Count} diapo(s) — export PDF (SaveAs)...")
-        _report("Export PDF en cours...", None)
-        # SaveAs au format PDF (ppSaveAsPDF = 32), simple à marshaler en liaison tardive.
-        presentation.SaveAs(pdf_path, 32)
-        logger.debug("[PPT→Web] COM : PDF généré.")
-    finally:
-        if powerpoint is not None and previous_security is not None:
+
+    time.sleep(2.0)
+
+    import sys, subprocess
+    is_frozen = getattr(sys, 'frozen', False)
+
+    if not is_frozen:
+        logger.info("Mode DEV détecté : Auto-relance interne via Python...")
+        safe_cwd = os.path.dirname(os.path.abspath(__file__))
+        commande = [sys.executable, os.path.abspath(__file__)]
+
+        skip_next = False
+        for arg in sys.argv[1:]:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg in ["--autorun", "--index"]:
+                skip_next = True
+                continue
+            commande.append(arg)
+
+        subprocess.Popen(commande, cwd=safe_cwd)
+    else:
+        logger.info("Mode PROD détecté : Arrêt total pour laisser le .bat synchroniser.")
+        os._exit(2)
+    os._exit(0)
+
+def on_quit(control_panel_window, tracker=None):
+    """Arrêt propre de l'application."""
+    logger.info("🛑 Demande d'arrêt initiée...")
+    state.shutdown_event.set()
+    state.pause_event.set()
+
+    if tracker:
+        tracker.cleanup()
+        logger.info("✓ Tracker réseau désactivé.")
+
+    logger.info("🧹 Nettoyage des processus enfants (Chrome, Node, etc.)...")
+    process_manager.kill_all_tracked()
+
+    try:
+        banners = getattr(state.app_root, "_app_banners", [])
+        for b in banners:
+            if b is not None and b.winfo_exists():
+                b.destroy()
+    except Exception:
+        pass
+
+    # --- LE RETOUR DU BLOC INTELLIGENT ---
+    if is_admin_open():
+        logger.warning("🛡️ Le Dashboard Admin est ouvert : Le Kiosque s'arrête, mais l'application reste active.")
+        state.pending_full_exit = True
+        try:
+            if control_panel_window:
+                control_panel_window.destroy()
+        except Exception:
+            pass
+        return
+
+    logger.info("💀 Arrêt définitif de l'application Tkinter.")
+    try:
+        if hasattr(state, 'app_root') and state.app_root:
+            state.app_root.destroy()
+        else:
+            if control_panel_window:
+                control_panel_window.destroy()
+    except Exception:
+        pass
+
+    process_manager.kill_all_tracked()
+    logger.info("✅ Kiosk Engine fermé avec succès.")
+
+    import os
+    os._exit(0)
+# ══════════════════════════════════════════════════════════════════════
+# HELPERS DE DÉMARRAGE (extraits pour lisibilité)
+# ══════════════════════════════════════════════════════════════════════
+
+def _parse_cli() -> tuple[str, str | None, str | None, str | None]:
+    """Parse les arguments CLI. Retourne (base_dir, autorun, site, workspace)."""
+    args = sys.argv[1:]
+
+    def _pop_arg(name):
+        nonlocal args
+        if name in args:
+            idx = args.index(name)
+            if idx + 1 < len(args):
+                val = args[idx + 1]
+                del args[idx:idx + 2]
+                return val
+        return None
+
+    autorun = _pop_arg("--autorun")
+    cli_site = _pop_arg("--site")
+    cli_ws = _pop_arg("--workspace")
+
+
+    if not autorun:
+        appdata_dir = os.getenv('LOCALAPPDATA')
+        autorun_file = os.path.join(appdata_dir, "KioskEngine_App", "next_autorun.txt")
+        if os.path.exists(autorun_file):
             try:
-                powerpoint.AutomationSecurity = previous_security
+                with open(autorun_file, "r", encoding="utf-8") as f:
+                    autorun = f.read().strip()
+                os.remove(autorun_file)  # On le supprime pour ne le lire qu'une seule fois
             except Exception:
                 pass
-        _safe_close(presentation, powerpoint)
-        pythoncom.CoUninitialize()
-
-    if not os.path.isfile(pdf_path) or os.path.getsize(pdf_path) == 0:
-        raise RuntimeError(
-            "Export PDF PowerPoint sans effet (ExportAsFixedFormat n'a rien produit). "
-            "Le fichier est-il valide et accessible ?"
-        )
-    return _pdf_to_pngs(pdf_path, out_dir, cleanup_pdf=True)
 
 
-def _pdf_to_pngs(pdf_path: str, out_dir: str, cleanup_pdf: bool = False) -> list[dict]:
-    """Rend chaque page d'un PDF en PNG (slide_001.png, …) via PyMuPDF.
-
-    Le bord long est calé sur _EXPORT_LONG_EDGE_PX (aspect préservé). 'ms' vaut 0 : le
-    minutage par diapo est appliqué ensuite (durée/diapo prioritaire).
-    """
-    try:
-        import fitz  # PyMuPDF
-    except Exception as e:
-        raise RuntimeError(
-            "PyMuPDF est requis pour la conversion PPT→PDF→images. Installer le paquet "
-            "'pymupdf' (pip install pymupdf) depuis le dépôt interne."
-        ) from e
-
-    slides_meta: list[dict] = []
-    doc = None
-    try:
-        doc = fitz.open(pdf_path)
-        total_pages = doc.page_count or 1
-        for index in range(doc.page_count):
-            page = doc.load_page(index)
-            long_edge = max(page.rect.width, page.rect.height) or 1.0
-            zoom = _EXPORT_LONG_EDGE_PX / long_edge
-            pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-            file_name = f"slide_{index + 1:03d}.{_IMG_EXT}"
-            pixmap.save(os.path.join(out_dir, file_name))
-            slides_meta.append({"file": file_name, "ms": 0})
-            _report(f"Rendu des diapos... {index + 1}/{total_pages}",
-                    (index + 1) / total_pages)
-    finally:
-        if doc is not None:
-            doc.close()
-        if cleanup_pdf:
-            try:
-                os.remove(pdf_path)
-            except OSError:
-                pass
-
-    if not slides_meta:
-        raise RuntimeError("Le PDF exporté ne contient aucune page.")
-    return slides_meta
-
-
-def _compute_export_size(presentation) -> tuple[int, int]:
-    """Calcule la taille d'export en pixels en préservant l'aspect de la diapo.
-
-    PageSetup.SlideWidth/SlideHeight sont en points ; on cale le bord long sur
-    _EXPORT_LONG_EDGE_PX pour éviter toute déformation (le letterbox final est
-    géré côté HTML par background-size: contain).
-    """
-    try:
-        slide_w = float(presentation.PageSetup.SlideWidth)
-        slide_h = float(presentation.PageSetup.SlideHeight)
-    except Exception:
-        slide_w, slide_h = 16.0, 9.0  # repli 16:9 si PageSetup indisponible
-
-    if slide_w <= 0 or slide_h <= 0:
-        slide_w, slide_h = 16.0, 9.0
-
-    if slide_w >= slide_h:
-        width = _EXPORT_LONG_EDGE_PX
-        height = int(round(_EXPORT_LONG_EDGE_PX * slide_h / slide_w))
+    if args:
+        base_dir = args[0]
+    elif getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
     else:
-        height = _EXPORT_LONG_EDGE_PX
-        width = int(round(_EXPORT_LONG_EDGE_PX * slide_w / slide_h))
-    return width, height
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # TODO Base url AA ou AO
+    # AO
+    base_dir = r"\\sfs.corp\Apps\MANUFACTURING\Shopfloor Digit\Affichage Atelier\KioskEngine"
+
+    # AA
+    # base_dir = r"\\mycorp.corp\dfs\PrepMethodes\Services\PSE_Shopfloor_Execution\ATLANTIC\Affichage Atelier\KioskEngine"
+    return base_dir, autorun, cli_site, cli_ws
 
 
-def _read_advance_ms(slide) -> int:
-    """Retourne le minutage d'avancement auto d'une diapo en ms (0 si absent)."""
-    try:
-        transition = slide.SlideShowTransition
-        if transition.AdvanceOnTime and transition.AdvanceTime and transition.AdvanceTime > 0:
-            return int(round(float(transition.AdvanceTime) * 1000))
-    except Exception:
-        return 0
-    return 0
+def _setup_logger(base_dir: str):
+    """Configure loguru : console (si TTY) + fichier rotatif par poste."""
+    log_dir = os.path.join(base_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    pc_name = socket.gethostname()
+    log_file = os.path.join(log_dir, f"kiosk_{pc_name}.log")
+
+    logger.remove()
+    if sys.stdout is not None and hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
+        logger.add(
+            sys.stdout, colorize=True,
+            format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+                   "<level>{level: <8}</level> | "
+                   "<cyan>{thread.name: <15}</cyan> | "
+                   "<magenta>{name}:{function}:{line}</magenta> - <level>{message}</level>"
+        )
+    logger.add(log_file, rotation="5 MB", retention=3, encoding="utf-8", level="INFO")
 
 
-def _apply_slide_durations(slides_meta: list[dict], duree_diapo: Optional[int],
-                           fallback_slide_s: int) -> list[dict]:
-    """Fixe la durée d'affichage de chaque diapo, par ordre de priorité :
-
-      1. durée/diapo explicite (si fournie > 0) → uniforme, PRIORITAIRE ;
-      2. sinon, minutages présents dans le .pptx → respectés ;
-      3. sinon → durée par défaut uniforme (fallback_slide_s).
+def _auto_detect_site_ws(scope, base_dir: str) -> tuple[str | None, str | None]:
     """
-    if not slides_meta:
-        return slides_meta
-
-    if duree_diapo and duree_diapo > 0:
-        fixed_ms = max(_MIN_SLIDE_MS, int(duree_diapo * 1000))
-        for slide in slides_meta:
-            slide["ms"] = fixed_ms
-        return slides_meta
-
-    fallback_ms = max(_MIN_SLIDE_MS, int(fallback_slide_s * 1000))
-    has_native_timing = any(slide["ms"] > 0 for slide in slides_meta)
-
-    if has_native_timing:
-        for slide in slides_meta:
-            slide["ms"] = max(_MIN_SLIDE_MS, slide["ms"] or fallback_ms)
-        return slides_meta
-
-    for slide in slides_meta:
-        slide["ms"] = fallback_ms
-    return slides_meta
-
-
-def _build_show_html(slides_meta: list[dict], out_dir: str) -> str:
-    """Génère une page HTML autonome : défilement plein écran + fondu enchaîné.
-
-    Les images sont EMBARQUÉES en data URI (base64) directement dans la page : aucune
-    ressource externe n'est chargée, ce qui évite tout blocage des sous-ressources
-    file:// par Chrome (cause classique d'un écran noir alors que la page se charge).
+    Auto-détecte site/workspace si non résolu via scope :
+    - Si un seul site/ws existe, on le prend
+    - Sinon on prend le premier trouvé (fallback permissif)
     """
-    embedded = []
-    for slide in slides_meta:
-        with open(os.path.join(out_dir, slide["file"]), "rb") as handle:
-            b64 = base64.b64encode(handle.read()).decode("ascii")
-        embedded.append({"file": f"data:image/{_IMG_EXT};base64,{b64}", "ms": slide["ms"]})
-    payload = json.dumps(embedded, ensure_ascii=False)
-    return (_HTML_TEMPLATE
-            .replace("__CROSSFADE_MS__", str(_CROSSFADE_MS))
-            .replace("__SLIDES_JSON__", payload))
+    site = scope.kiosk_site
+    ws = scope.kiosk_workspace
+
+    if not site or not ws:
+        sites = cfg.list_sites(base_dir)
+        if len(sites) == 1:
+            site = site or sites[0]
+            workspaces = cfg.list_workspaces(base_dir, site)
+            if len(workspaces) == 1:
+                ws = ws or workspaces[0]
+
+    if not site or not ws:
+        logger.warning("Site/workspace non résolu. Fallback sur le premier disponible.")
+        for s in cfg.list_sites(base_dir):
+            for w in cfg.list_workspaces(base_dir, s):
+                site, ws = s, w
+                break
+            if site:
+                break
+
+    return site, ws
 
 
-# ── Emplacement approuvé existant (postes verrouillés par GPO) ──
-# Idée : ne PAS tenter d'AJOUTER un emplacement approuvé (l'UI/GPO le refuse), mais
-# RÉUTILISER ceux qu'Office approuve par défaut (ex. %APPDATA%\Microsoft\Templates),
-# qui restent actifs même Trust Center verrouillé. On y dépose une copie temporaire du
-# deck, exemptée de File Block, puis on la supprime juste après l'export.
-
-def _office_version() -> str:
-    """Version Office présente (clé PowerPoint dans HKCU), '16.0' par défaut (LTSC)."""
-    import winreg
-    for ver in _OFFICE_VERSIONS:
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                rf"Software\Microsoft\Office\{ver}\PowerPoint"):
-                return ver
-        except OSError:
-            continue
-    return "16.0"
-
-
-def _enumerate_trusted_locations(ver: str) -> list:
-    """Emplacements approuvés PowerPoint (chemins existants, locaux), %VARS% développées.
-
-    Lit les ruches non-stratégie ET stratégie : les emplacements par défaut d'Office y
-    figurent (ex. dossier Templates utilisateur). Renvoie [(chemin, allow_subfolders)].
-    """
-    import winreg
-    roots = [
-        (winreg.HKEY_CURRENT_USER,
-         rf"Software\Microsoft\Office\{ver}\PowerPoint\Security\Trusted Locations"),
-        (winreg.HKEY_CURRENT_USER,
-         rf"Software\Policies\Microsoft\Office\{ver}\PowerPoint\Security\Trusted Locations"),
-        (winreg.HKEY_LOCAL_MACHINE,
-         rf"Software\Policies\Microsoft\Office\{ver}\PowerPoint\Security\Trusted Locations"),
-    ]
-    unc_prefix = chr(92) * 2  # antislash x2 = préfixe d'un chemin réseau (à exclure)
-    found = []
-    for hive, base in roots:
-        try:
-            bkey = winreg.OpenKey(hive, base)
-        except OSError:
-            continue
-        try:
-            index = 0
-            while True:
-                try:
-                    sub = winreg.EnumKey(bkey, index)
-                    index += 1
-                except OSError:
-                    break
-                try:
-                    with winreg.OpenKey(bkey, sub) as skey:
-                        raw, _ = winreg.QueryValueEx(skey, "Path")
-                        path = os.path.expandvars(str(raw)).rstrip(chr(92))
-                        try:
-                            allow_sub, _ = winreg.QueryValueEx(skey, "AllowSubFolders")
-                        except OSError:
-                            allow_sub = 0
-                        if path and not path.startswith(unc_prefix) and os.path.isdir(path):
-                            found.append((path, bool(allow_sub)))
-                except OSError:
-                    continue
-        finally:
-            winreg.CloseKey(bkey)
-    return found
-
-
-def _dir_is_writable(folder: str) -> bool:
-    """Teste l'écriture réelle dans `folder` (plus fiable que os.access sous Windows)."""
-    probe = os.path.join(folder, f".ke_probe_{os.getpid()}")
-    try:
-        with open(probe, "w", encoding="utf-8") as handle:
-            handle.write("x")
-        os.remove(probe)
-        return True
-    except OSError:
-        return False
-
-
-def _pick_staging_dir() -> Optional[str]:
-    """Choisit un emplacement approuvé EXISTANT, local et inscriptible.
-
-    Priorité aux dossiers sous le profil utilisateur (Templates/Addins…), approuvés par
-    défaut et inscriptibles sans droits particuliers. Repli direct sur le dossier
-    Templates utilisateur si l'énumération ne donne rien.
-    """
-    try:
-        candidates = _enumerate_trusted_locations(_office_version())
-    except Exception:
-        candidates = []
-
-    appdata = (os.getenv("APPDATA") or "").rstrip(chr(92)).lower()
-
-    def under_profile(item):
-        return 0 if appdata and item[0].lower().startswith(appdata) else 1
-
-    for path, _allow in sorted(candidates, key=under_profile):
-        if _dir_is_writable(path):
-            return path
-
-    fallback = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"),
-                            "Microsoft", "Templates")
-    if os.path.isdir(fallback) and _dir_is_writable(fallback):
-        return fallback
+def _resolve_autorun(autorun: str | None, toutes_configs: dict[str, str]) -> str | None:
+    """Résout --autorun vers un chemin absolu, ou None si introuvable."""
+    if not autorun:
+        return None
+    if os.path.isabs(autorun) and os.path.exists(autorun):
+        return autorun
+    for display_name, full_path in toutes_configs.items():
+        if os.path.basename(full_path) == autorun or display_name == autorun:
+            return full_path
+    logger.warning(f"Config autorun '{autorun}' introuvable dans la hiérarchie.")
     return None
 
 
-def _stage_in_trusted_dir(pptx_path: str) -> Optional[str]:
-    """Copie le .pptx dans un emplacement approuvé existant ; renvoie le chemin local.
-
-    Un fichier situé dans un emplacement approuvé échappe au File Block ET à la Vue
-    protégée — y compris Trust Center verrouillé par GPO, car les emplacements
-    approuvés PAR DÉFAUT restent actifs. La copie est supprimée juste après l'export
-    (cf. finally de _convert). Renvoie None si rien d'inscriptible n'est trouvé (repli
-    sur le fichier d'origine côté appelant).
+def _load_and_compile(chemin_config: str, global_config: dict, base_dir: str,
+                       site: str | None, ws: str | None) -> dict:
     """
+    Charge + valide (Pydantic) + compile (résolution skills + playlist).
+    Retourne une config prête pour l'engine.
+    """
+    from models import RawKioskConfig
+    from pydantic import ValidationError
+
+    raw = cfg.charger_config(chemin_config, global_config)
+
     try:
-        staging_dir = _pick_staging_dir()
-        if not staging_dir:
-            logger.warning(
-                "[PPT→Web] Aucun emplacement approuvé inscriptible trouvé. Si l'ouverture "
-                "échoue, le File Block est sans échappatoire local (→ IT / conversion hors-poste)."
+        RawKioskConfig(**raw)
+    except ValidationError as e:
+        logger.critical("❌ Erreur de structure dans le fichier JSON ! Démarrage annulé.")
+        for error in e.errors():
+            loc = " -> ".join([str(x) for x in error['loc']])
+            logger.error(f"  → Champ [{loc}] : {error['msg']}")
+        raise ValueError("Configuration JSON invalide (structure/types).")
+
+    try:
+        return compile_config(base_dir, raw, global_config, site=site, workspace=ws)
+    except CompilationError as e:
+        logger.critical(f"❌ Échec de la compilation : {e}")
+        raise ValueError(f"Configuration non compilable : {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════
+
+def main():
+    try:
+        base_dir, autorun_config, cli_site, cli_ws = _parse_cli()
+
+        _setup_logger(base_dir)
+        pc_name = socket.gethostname()
+        logger.info(f"Base dir : {base_dir}")
+        logger.info(f"Logs réseau activés pour le poste : {pc_name}")
+
+        global_config = cfg.load_global_config(base_dir)
+
+        root = tk.Tk()
+        root.withdraw()
+        state.app_root = root
+
+        chemin_icone = os.path.join(base_dir, "assets", "icon.ico")
+        if os.path.exists(chemin_icone):
+            try:
+                root.iconbitmap(default=chemin_icone)
+            except Exception as e:
+                logger.warning(f"Impossible de charger l'icône : {e}")
+
+        if cli_site:
+            os.environ["KIOSK_SITE"] = cli_site
+        if cli_ws:
+            os.environ["KIOSK_WORKSPACE"] = cli_ws
+
+        # ── RÉSOLUTION DU SCOPE RBAC ──
+        scope = cfg.resolve_user_scope(base_dir)
+        state.current_scope = scope
+        logger.info(
+            f"Scope résolu : {scope.role} | "
+            f"site={scope.kiosk_site} | ws={scope.kiosk_workspace}"
+        )
+
+        kiosk_site, kiosk_ws = _auto_detect_site_ws(scope, base_dir)
+        state.current_scope.kiosk_site = kiosk_site
+        state.current_scope.kiosk_workspace = kiosk_ws
+
+        configs_dir = base_dir
+
+        # ── SÉLECTION DE LA CONFIG ──
+        toutes_configs = cfg.list_all_launchables_hierarchical(base_dir, kiosk_site, kiosk_ws)
+        chemin_config = _resolve_autorun(autorun_config, toutes_configs)
+
+        # ── DÉBUT CASCADE LANCEMENT AUTO ──
+        if not chemin_config:
+            mapping = cfg.load_poste_mapping(base_dir)
+            pc_name = socket.gethostname()
+
+            # 1. Mapping Poste (Priorité absolue - Sur mesure)
+            defaut_pc = mapping.get(pc_name, {}).get("config_par_defaut")
+            if defaut_pc:
+                chemin_config = _resolve_autorun(defaut_pc, toutes_configs)
+                if chemin_config: logger.info(f"Cascade [1/3] : Lancement Auto du POSTE -> {defaut_pc}")
+
+            # 2. Workspace (Norme de l'atelier)
+            if not chemin_config and kiosk_site and kiosk_ws:
+                wc = cfg.load_workspace_config(base_dir, kiosk_site, kiosk_ws)
+                defaut_ws = wc.get("config_par_defaut")
+                if defaut_ws:
+                    chemin_config = _resolve_autorun(defaut_ws, toutes_configs)
+                    if chemin_config: logger.info(f"Cascade [2/3] : Lancement Auto du WORKSPACE -> {defaut_ws}")
+
+            # 3. Site (Norme de l'usine)
+            if not chemin_config and kiosk_site:
+                sc = cfg.load_site_config(base_dir, kiosk_site)
+                defaut_site = sc.get("config_par_defaut")
+                if defaut_site:
+                    chemin_config = _resolve_autorun(defaut_site, toutes_configs)
+                    if chemin_config: logger.info(f"Cascade [3/3] : Lancement Auto du SITE -> {defaut_site}")
+
+            # 4. Mode Manuel (Si aucune règle n'a été trouvée)
+            if not chemin_config:
+                selector = ConfigSelectorView(root, configs_dir, base_dir)
+                chemin_config = selector.get_selection()
+
+            if not chemin_config:
+                # 🚨 FIX : On vérifie si l'admin est ouvert avant de tout détruire !
+                if is_admin_open():
+                    logger.info("Le sélecteur a été fermé, mais l'Admin est actif. Maintien du processus.")
+                    # On signale à l'état global que la fermeture de l'Admin devra couper tout le programme
+                    state.pending_full_exit = True
+                    root.mainloop()  # On maintient l'application en vie
+                    os._exit(0)
+                else:
+                    logger.info("Aucune configuration sélectionnée. Arrêt.")
+                    try:
+                        root.destroy()
+                    except Exception:
+                        pass
+                    sys.exit(0)
+
+        state.active_config_name = os.path.basename(chemin_config)
+        state.active_config_path = chemin_config
+        logger.info(f"Chargement : {chemin_config}")
+
+        # ── SPLASH (affiché AVANT la compilation) ──
+        # La compilation peut convertir des présentations PowerPoint (plusieurs
+        # secondes). On crée le splash maintenant pour donner un retour visuel dès le
+        # lancement, au lieu de laisser un écran figé pendant la conversion.
+        splash = SplashScreenView(master=root)
+        splash.set_status("Chargement de la configuration...")
+        splash.set_progress(2)
+        try:
+            root.update()
+        except tk.TclError:
+            pass
+
+        # On relie la progression de la conversion PPT au splash. La compilation tourne
+        # sur le thread principal : le callback peut donc mettre à jour le splash et
+        # pomper la boucle Tk directement (même schéma que les phases moniteurs/warmup).
+        from ppt_render import set_progress_callback as _ppt_set_progress_cb
+
+        _compile_pct = [2.0]            # progression courante (liste = mutable en closure)
+        _COMPILE_PCT_CAP = 50.0         # plafond réservé à la phase compilation/conversion
+
+        def _on_compile_progress(message, fraction=None):
+            # Avance la barre de façon monotone vers le plafond (sans connaître le nombre
+            # total de présentations) puis pompe la boucle Tk pour rafraîchir l'affichage.
+            _compile_pct[0] += (_COMPILE_PCT_CAP - _compile_pct[0]) * 0.18
+            try:
+                splash.set_status(message)
+                splash.set_progress(_compile_pct[0])
+                root.update()
+            except tk.TclError:
+                pass
+
+        _ppt_set_progress_cb(_on_compile_progress)
+
+        # ── CHARGEMENT + VALIDATION + COMPILATION ──
+        try:
+            config = _load_and_compile(chemin_config, global_config, base_dir,
+                                       kiosk_site, kiosk_ws)
+        finally:
+            _ppt_set_progress_cb(None)  # on débranche le hook quoi qu'il arrive
+
+        param_globaux = config.get("parametres_globaux", {})
+        param_globaux["base_dir"] = base_dir
+
+        # ── VALIDATION SÉCURITÉ ──
+        errors = validate_config(config, global_config)
+        if errors:
+            logger.error(f"Validation sécurité — {len(errors)} problème(s) bloquant(s) :")
+            for err in errors:
+                logger.error(f"  → {err}")
+            raise ValueError("Configuration non sécurisée. Corrigez avant lancement.")
+
+
+        # ── BANNER ── (le splash a déjà été créé avant la compilation)
+        splash.set_status("Préparation du lancement...")
+        splash.set_progress(52)
+
+        pc_name = socket.gethostname()
+        mapping = cfg.load_poste_mapping(base_dir)
+        nom_poste = mapping.get(pc_name, {}).get("nom", "")
+
+        affichage_poste = nom_poste if nom_poste else pc_name
+        texte_banniere = f"{kiosk_site} / {kiosk_ws}  —   {affichage_poste}"
+
+        liste_ecrans = config.get("affichage_config", [])
+        is_admin = state.current_scope.is_any_admin
+
+        moniteurs_utilises = set()
+        for ecran in liste_ecrans:
+            moniteurs_utilises.add(ecran.get("monitor_index", 1))
+
+        if not moniteurs_utilises:
+            moniteurs_utilises.add(1)
+
+        root._app_banners = []
+        for m_idx in moniteurs_utilises:
+            banner = AppBannerView(root, texte_banniere, monitor_index=m_idx, show_buttons=not is_admin,
+                                   base_dir=base_dir)
+            root._app_banners.append(banner)
+
+
+        # ── THREADS MONITEURS ──
+        ecrans = config.get("affichage_config", [])
+        total_ecrans = max(1, len(ecrans))
+        for i, ecran in enumerate(ecrans, start=1):
+            idx = ecran.get("monitor_index", 1)
+            apps = ecran.get("applications", [])
+            splash.set_status(f"Démarrage du moniteur {idx}...")
+            splash.set_progress(52 + (20 * i / total_ecrans))
+
+            t = threading.Thread(
+                target=thread_moniteur,
+                args=(idx, apps, param_globaux, kiosk_site or "", kiosk_ws or ""),
+                daemon=True,
             )
-            return None
-        # Balaye d'éventuelles copies orphelines (si une suppression a échoué avant).
-        for name in os.listdir(staging_dir):
-            if name.startswith("~ke_staged_") and name.endswith(".pptx"):
-                try:
-                    os.remove(os.path.join(staging_dir, name))
-                except OSError:
-                    pass
-        local = os.path.join(staging_dir, f"~ke_staged_{os.getpid()}.pptx")
-        shutil.copyfile(pptx_path, local)
-        logger.debug(f"[PPT→Web] Deck copié dans l'emplacement approuvé : {staging_dir}")
-        return local
+            t.start()
+            try:
+                root.update_idletasks()
+                root.update()
+            except tk.TclError:
+                pass
+
+        # ── WARMUP ──
+        splash.set_status("Initialisation des systèmes...")
+        warmup_duration = 5.5
+        warmup_start = time.monotonic()
+        while True:
+            elapsed = time.monotonic() - warmup_start
+            if elapsed >= warmup_duration:
+                break
+            splash.set_progress(72 + ((elapsed / warmup_duration) * 25))
+            try:
+                root.update_idletasks()
+                root.update()
+            except tk.TclError:
+                break
+            time.sleep(0.05)
+
+        splash.set_status("Interface prête")
+        splash.set_progress(100)
+        try:
+            root.update_idletasks()
+            root.update()
+        except tk.TclError:
+            pass
+        time.sleep(0.15)
+        splash.destroy()
+
+        # ── TRACKER + CONTROL PANEL ──
+        nom_fichier = os.path.basename(chemin_config)
+        tracker = None
+        if kiosk_site and kiosk_ws:
+            tracker = InstanceTracker(
+                base_dir=base_dir,
+                nom_config=nom_fichier,
+                site_name=kiosk_site,
+                ws_name=kiosk_ws,
+                global_config=global_config,
+                restart_callback=restart_app,
+            )
+
+        for b in root._app_banners:
+            b.on_stop = lambda: on_quit(None, tracker)
+
+        if state.current_scope.is_any_admin:
+            ControlPanelView(
+                master=root,
+                base_dir=base_dir,
+                nom_fichier=nom_fichier,
+                tracker=tracker,
+                on_quit_callback=on_quit,
+            )
+
+        root.mainloop()
+
     except Exception as e:
-        logger.error(f"[PPT→Web] Copie en emplacement approuvé impossible : {e}")
-        return None
+            logger.critical(f"Erreur fatale : {e}")
+            try:
+                # Le splash (topmost) a pu être créé avant la compilation : on le retire
+                # pour ne pas masquer la boîte d'erreur.
+                if 'splash' in locals() and splash:
+                    splash.destroy()
+            except Exception:
+                pass
+            try:
+                from tkinter import messagebox
+                err_root = tk.Tk()
+                err_root.withdraw()
+                err_root.attributes('-topmost', True)
+                messagebox.showerror("Erreur Fatale", f"Impossible de démarrer :\n{e}", parent=err_root)
+                err_root.destroy()
+            except Exception:
+                pass
+            try:
+                if 'root' in locals() and root:
+                    root.destroy()
+            except Exception:
+                pass
+            sys.exit(1)
 
+if __name__ == "__main__":
+    base_dir_param = sys.argv[1] if len(sys.argv) > 1 else r"\\Serveur\KiosquePartage"
 
-# ── Utilitaires bas niveau ────────────────────────────────────────────
-
-def _resolve_cache_root(cache_root: Optional[str]) -> str:
-    """Renvoie la racine de cache (par défaut sous %LOCALAPPDATA%)."""
-    if cache_root:
-        return cache_root
-    base = os.getenv("LOCALAPPDATA") or os.path.expanduser("~")
-    return os.path.join(base, "KioskEngine", _CACHE_DIR_NAME)
-
-
-def _cache_key(pptx_path: str, duree_diapo: Optional[int]) -> str:
-    """Clé de cache stable : SHA-256(chemin | mtime | taille | durée/diapo).
-
-    La durée/diapo entre dans la clé : deux usages du même .pptx avec des durées
-    différentes produisent deux pages distinctes (le minutage est figé dans le HTML).
-    """
-    stats = os.stat(pptx_path)
-    timing = duree_diapo if (duree_diapo and duree_diapo > 0) else "auto"
-    raw = f"v{_RENDER_VERSION}|{os.path.abspath(pptx_path)}|{int(stats.st_mtime)}|{stats.st_size}|{timing}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:_CACHE_KEY_LEN]
-
-
-def _total_seconds(slides_meta: list[dict], boucles: int) -> int:
-    """Durée d'affichage totale = somme des durées de diapos × nombre de boucles."""
-    cycle_ms = sum(int(slide.get("ms", 0)) for slide in slides_meta)
-    return max(1, int(round(cycle_ms * max(1, boucles) / 1000.0)))
-
-
-def _read_meta_slides(out_dir: str) -> Optional[list[dict]]:
-    """Relit les minutages des diapos depuis le meta.json du cache (ou None)."""
-    try:
-        with open(os.path.join(out_dir, _META_FILENAME), "r", encoding="utf-8") as f:
-            return json.load(f).get("slides")
-    except Exception:
-        return None
-
-
-def _atomic_write_text(path: str, text: str) -> None:
-    """Écriture atomique d'un fichier texte (tmpfile + os.replace + fsync)."""
-    tmp_path = f"{path}.tmp.{os.getpid()}"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    except Exception:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        raise
-
-
-def _write_meta(out_dir: str, pptx_path: str, slides_meta: list[dict]) -> None:
-    """Écrit un meta.json informatif (debug / traçabilité du cache + minutage)."""
-    meta = {"source": os.path.abspath(pptx_path), "slides": slides_meta}
-    _atomic_write_text(os.path.join(out_dir, _META_FILENAME),
-                       json.dumps(meta, ensure_ascii=False, indent=2))
-
-
-def _safe_close(presentation, powerpoint) -> None:
-    """Ferme proprement la présentation et l'application COM (best-effort)."""
-    try:
-        if presentation is not None:
-            presentation.Close()
-    except Exception:
-        pass
-    try:
-        if powerpoint is not None:
-            powerpoint.Quit()
-    except Exception:
-        pass
-
-
-# ── Gabarit HTML (file:// autonome, aucune ressource externe) ──────────
-# NOTE: ceci est un fichier déployé tel quel et ouvert via file:// dans le Chrome
-# du kiosque — d'où un document HTML complet (DOCTYPE/html/head/body).
-_HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Diaporama</title>
-<style>
-  :root { color-scheme: dark; }
-  html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
-  .layer {
-    position: fixed;
-    inset: 0;
-    background-color: #000;
-    background-position: center center;
-    background-repeat: no-repeat;
-    background-size: contain;
-    opacity: 0;
-    transition: opacity __CROSSFADE_MS__ms ease-in-out;
-    will-change: opacity;
-  }
-  .layer.is-active { opacity: 1; }
-</style>
-</head>
-<body>
-  <div class="layer" id="layer-a"></div>
-  <div class="layer" id="layer-b"></div>
-  <script>
-    "use strict";
-    const SLIDES = __SLIDES_JSON__;
-
-    (function runSlideshow() {
-      const layers = [document.getElementById("layer-a"), document.getElementById("layer-b")];
-      if (!Array.isArray(SLIDES) || SLIDES.length === 0) { return; }
-
-      let currentIndex = 0;
-      let frontLayer = 0;
-
-      function paint(layerIdx, slideIdx) {
-        layers[layerIdx].style.backgroundImage = 'url("' + SLIDES[slideIdx].file + '")';
-      }
-
-      function preloadNext(slideIdx) {
-        // Pre-chargement opportuniste pour un fondu plus fluide (non bloquant).
-        const img = new Image();
-        img.src = SLIDES[slideIdx].file;
-      }
-
-      function advance() {
-        const nextIndex = (currentIndex + 1) % SLIDES.length;
-        const backLayer = frontLayer === 0 ? 1 : 0;
-
-        paint(backLayer, nextIndex);
-        layers[backLayer].classList.add("is-active");
-        layers[frontLayer].classList.remove("is-active");
-
-        frontLayer = backLayer;
-        currentIndex = nextIndex;
-        preloadNext((currentIndex + 1) % SLIDES.length);
-        window.setTimeout(advance, SLIDES[currentIndex].ms);
-      }
-
-      paint(frontLayer, 0);
-      layers[frontLayer].classList.add("is-active");
-      preloadNext(SLIDES.length > 1 ? 1 : 0);
-
-      if (SLIDES.length > 1) {
-        window.setTimeout(advance, SLIDES[0].ms);
-      }
-
-      // Empeche la mise en veille de l'ecran si la politique d'energie l'autorise.
-      try {
-        if ("wakeLock" in navigator) {
-          const requestLock = function () { navigator.wakeLock.request("screen").catch(function () {}); };
-          requestLock();
-          document.addEventListener("visibilitychange", function () {
-            if (document.visibilityState === "visible") { requestLock(); }
-          });
-        }
-      } catch (err) { /* wakeLock indisponible : sans gravite */ }
-    })();
-  </script>
-</body>
-</html>
-"""
+    _appliquer_securites_demarrage(base_dir_param)
+    main()
