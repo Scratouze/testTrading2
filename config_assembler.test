@@ -184,12 +184,18 @@ def _export_slides_com(pptx_path: str, out_dir: str) -> list[dict]:
             powerpoint.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
         except Exception:
             previous_security = None
-        # L'export PDF ne dépend pas d'une fenêtre de rendu → WithWindow=False (rien à
-        # l'écran). 2 = ppFixedFormatTypePDF.
+        try:
+            powerpoint.DisplayAlerts = 1  # ppAlertsNone : aucun dialogue pendant l'automatisation
+        except Exception:
+            pass
+        # L'export PDF ne dépend pas d'une fenêtre de rendu → WithWindow=False (rien à l'écran).
         presentation = powerpoint.Presentations.Open(
             os.path.abspath(pptx_path), ReadOnly=True, Untitled=False, WithWindow=False
         )
-        presentation.ExportAsFixedFormat(pdf_path, 2)
+        # SaveAs au format PDF (ppSaveAsPDF = 32) : plus simple à marshaler en liaison
+        # tardive que ExportAsFixedFormat (dont un paramètre optionnel est un objet COM,
+        # d'où l'erreur « Python instance can not be converted to a COM object »).
+        presentation.SaveAs(pdf_path, 32)
     finally:
         if powerpoint is not None and previous_security is not None:
             try:
