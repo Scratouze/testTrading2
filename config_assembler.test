@@ -32,6 +32,7 @@ import os
 import json
 import shutil
 import hashlib
+import base64
 from typing import Optional
 
 from loguru import logger
@@ -50,6 +51,7 @@ _DONE_MARKER = ".render_done"       # marqueur de cache complet (anti-cache part
 _META_FILENAME = "meta.json"
 _HTML_FILENAME = "show.html"
 _CACHE_KEY_LEN = 16
+_RENDER_VERSION = 2                 # bumper à chaque changement de rendu → invalide les caches
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -131,7 +133,7 @@ def _convert(pptx_path: str, duree_diapo: Optional[int], boucles: int,
 
         slides_meta = _apply_slide_durations(slides_meta, duree_diapo, fallback_slide_s)
 
-        _atomic_write_text(html_path, _build_show_html(slides_meta))
+        _atomic_write_text(html_path, _build_show_html(slides_meta, out_dir))
         _write_meta(out_dir, pptx_path, slides_meta)
 
         # Marqueur écrit en dernier : sa présence garantit un cache complet.
@@ -270,9 +272,19 @@ def _apply_slide_durations(slides_meta: list[dict], duree_diapo: Optional[int],
     return slides_meta
 
 
-def _build_show_html(slides_meta: list[dict]) -> str:
-    """Génère une page HTML autonome : défilement plein écran + fondu enchaîné."""
-    payload = json.dumps(slides_meta, ensure_ascii=False)
+def _build_show_html(slides_meta: list[dict], out_dir: str) -> str:
+    """Génère une page HTML autonome : défilement plein écran + fondu enchaîné.
+
+    Les images sont EMBARQUÉES en data URI (base64) directement dans la page : aucune
+    ressource externe n'est chargée, ce qui évite tout blocage des sous-ressources
+    file:// par Chrome (cause classique d'un écran noir alors que la page se charge).
+    """
+    embedded = []
+    for slide in slides_meta:
+        with open(os.path.join(out_dir, slide["file"]), "rb") as handle:
+            b64 = base64.b64encode(handle.read()).decode("ascii")
+        embedded.append({"file": f"data:image/{_IMG_EXT};base64,{b64}", "ms": slide["ms"]})
+    payload = json.dumps(embedded, ensure_ascii=False)
     return (_HTML_TEMPLATE
             .replace("__CROSSFADE_MS__", str(_CROSSFADE_MS))
             .replace("__SLIDES_JSON__", payload))
@@ -435,7 +447,7 @@ def _cache_key(pptx_path: str, duree_diapo: Optional[int]) -> str:
     """
     stats = os.stat(pptx_path)
     timing = duree_diapo if (duree_diapo and duree_diapo > 0) else "auto"
-    raw = f"{os.path.abspath(pptx_path)}|{int(stats.st_mtime)}|{stats.st_size}|{timing}"
+    raw = f"v{_RENDER_VERSION}|{os.path.abspath(pptx_path)}|{int(stats.st_mtime)}|{stats.st_size}|{timing}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:_CACHE_KEY_LEN]
 
 
