@@ -181,17 +181,14 @@ def _export_slides_com(pptx_path: str, out_dir: str) -> list[dict]:
             powerpoint.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
         except Exception:
             previous_security = None
-        # WithWindow=True : PowerPoint doit pouvoir *rendre* les diapos, sinon l'export
-        # est silencieusement sans effet (aucun PNG écrit). On repousse la fenêtre hors
-        # écran pour qu'elle n'apparaisse pas sur le kiosque pendant la conversion.
+        # WithWindow=True : PowerPoint doit pouvoir *rendre* les diapos, sinon Slide.Export
+        # reste silencieusement sans effet. NB : déplacer la fenêtre hors écran casse le
+        # rendu sur certains postes (GPU/RDP : fenêtre non composée → export vide). On la
+        # laisse donc visible le temps de la conversion, qui a lieu une seule fois au
+        # démarrage (à la compilation de la config), puis est mise en cache.
         presentation = powerpoint.Presentations.Open(
             os.path.abspath(pptx_path), ReadOnly=True, Untitled=False, WithWindow=True
         )
-        try:
-            powerpoint.WindowState = 1                  # ppWindowNormal (minimisé = pas de rendu)
-            powerpoint.Left, powerpoint.Top = 32000, 32000
-        except Exception:
-            pass  # le positionnement hors-écran est un confort, pas une nécessité
 
         export_w, export_h = _compute_export_size(presentation)
         slides_meta: list[dict] = []
@@ -201,11 +198,14 @@ def _export_slides_com(pptx_path: str, out_dir: str) -> list[dict]:
             file_name = f"slide_{index:03d}.{_IMG_EXT}"
             target = os.path.join(out_dir, file_name)
             slide.Export(target, _IMG_FILTER, export_w, export_h)
+            # Repli : certains postes refusent l'export avec dimensions explicites.
+            if not os.path.isfile(target):
+                slide.Export(target, _IMG_FILTER)
             # Vérification : un export silencieusement sans effet est ainsi détecté tôt.
             if not os.path.isfile(target):
                 raise RuntimeError(
                     f"Export PowerPoint sans effet : aucun fichier écrit pour la diapo "
-                    f"{index} (vérifier le mode d'ouverture / les filtres graphiques)."
+                    f"{index} (filtres graphiques indisponibles ? rendu écran impossible ?)."
                 )
             slides_meta.append({"file": file_name, "ms": _read_advance_ms(slide)})
 
