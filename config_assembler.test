@@ -168,7 +168,7 @@ def _export_slides_com(pptx_path: str, out_dir: str) -> list[dict]:
     fonction afin que le module reste importable hors Windows (tests, CI).
     """
     import pythoncom
-    import win32com.client
+    import win32com.client.dynamic
 
     pdf_path = os.path.join(out_dir, "_deck.pdf")
     pythoncom.CoInitialize()
@@ -176,9 +176,11 @@ def _export_slides_com(pptx_path: str, out_dir: str) -> list[dict]:
     presentation = None
     previous_security = None
     try:
-        powerpoint = win32com.client.Dispatch("PowerPoint.Application")
-        # Mode automatisation : désactive macros + alertes (aucun dialogue ne doit figer
-        # le kiosque sans surveillance). Restauré dans le finally.
+        # Liaison TARDIVE forcée (dynamic.Dispatch) : évite les wrappers gen_py, dont les
+        # arguments optionnels (sentinelles) cassent SaveAs/ExportAsFixedFormat avec
+        # « Python instance can not be converted to a COM object ».
+        logger.debug("[PPT→Web] COM : démarrage de PowerPoint (liaison tardive)...")
+        powerpoint = win32com.client.dynamic.Dispatch("PowerPoint.Application")
         try:
             previous_security = powerpoint.AutomationSecurity
             powerpoint.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
@@ -189,13 +191,14 @@ def _export_slides_com(pptx_path: str, out_dir: str) -> list[dict]:
         except Exception:
             pass
         # L'export PDF ne dépend pas d'une fenêtre de rendu → WithWindow=False (rien à l'écran).
+        logger.debug("[PPT→Web] COM : ouverture du deck...")
         presentation = powerpoint.Presentations.Open(
             os.path.abspath(pptx_path), ReadOnly=True, Untitled=False, WithWindow=False
         )
-        # SaveAs au format PDF (ppSaveAsPDF = 32) : plus simple à marshaler en liaison
-        # tardive que ExportAsFixedFormat (dont un paramètre optionnel est un objet COM,
-        # d'où l'erreur « Python instance can not be converted to a COM object »).
+        logger.debug(f"[PPT→Web] COM : {presentation.Slides.Count} diapo(s) — export PDF (SaveAs)...")
+        # SaveAs au format PDF (ppSaveAsPDF = 32), simple à marshaler en liaison tardive.
         presentation.SaveAs(pdf_path, 32)
+        logger.debug("[PPT→Web] COM : PDF généré.")
     finally:
         if powerpoint is not None and previous_security is not None:
             try:
