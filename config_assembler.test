@@ -1,0 +1,837 @@
+
+"""
+ui/views/config_assembler.py — Assembleur de configuration kiosk.
+
+Permet de composer une configuration en :
+  - définissant les paramètres globaux (nom_atelier, timeouts, etc.)
+  - ajoutant des écrans (monitor_index)
+  - pour chaque écran, en référençant des skills avec une durée d'affichage
+
+Les skills sont choisis dans une combobox hiérarchique (WS > SITE > GLOBAL).
+"""
+
+import tkinter as tk
+from tkinter import ttk
+from ui.components import AirbusMessageBox as messagebox
+from ui.components import AirbusInputDialog as simpledialog
+from typing import Optional, Callable
+from copy import deepcopy
+
+from loguru import logger
+
+import config as cfg
+import skills
+from ui.theme import Colors, Fonts, apply_ttk_styles, Termes
+from ui.components import NavBar, AirbusButton, apply_borderless, make_resizable, show_loading
+
+
+class ConfigAssemblerView(tk.Toplevel):
+    """Éditeur de configuration kiosk (type='kiosk')."""
+
+    def __init__(self, parent, base_dir: str, config_path: str, scope: str,
+                 site: Optional[str] = None, workspace: Optional[str] = None,
+                 on_saved: Optional[Callable] = None):
+        super().__init__(parent)
+        self.base_dir = base_dir
+        self.config_path = config_path
+        self.scope = scope
+        self.site = site
+        self.workspace = workspace
+        self.on_saved = on_saved
+
+        self.data = cfg._load_json(config_path)
+        if not self.data:
+            self.data = {"type": "kiosk", "parametres_globaux": {}, "affichage_config": []}
+        self.draft = deepcopy(self.data)
+        self.draft.setdefault("affichage_config", [])
+        self._dirty = False
+
+        self._available_skills = skills.list_skills_hierarchical(
+            base_dir, site, workspace
+        )
+
+        # 1. Config de base
+        apply_borderless(self)
+        self.title(f"{Termes.CAROUSEL} — assembleur")
+        self.configure(bg=Colors.BG_PAGE)
+
+        # 2. Forcer au premier plan (SANS le transient)
+        self.attributes('-topmost', True)
+        self.grab_set()
+        self.focus_force()
+
+        # 3. Construire l'interface
+        self._setup_ui()
+        self._refresh_screens()
+
+        # 4. Positionner au centre de l'écran et afficher
+        self.update_idletasks()
+        auto_w, auto_h = 820, 660
+        x = max(0, (self.winfo_screenwidth() // 2) - (auto_w // 2))
+        y = max(0, (self.winfo_screenheight() // 2) - (auto_h // 2))
+        self.geometry(f"{auto_w}x{auto_h}+{x}+{y}")
+        self.minsize(720, 540)
+
+        apply_ttk_styles(self)
+        make_resizable(self, min_width=720, min_height=540)
+
+    def _setup_window(self):
+        pass  # Intégré directement dans __init__
+
+    def _set_modal_safe(self):
+        try:
+            self.transient(self.master)
+            self.grab_set()
+            logger.info("🔒 [ConfigAssembler] Fenêtre verrouillée au premier plan.")
+        except Exception as e:
+            logger.error(f"❌ [ConfigAssembler] Échec du verrouillage modal : {e}")
+
+    def _setup_ui(self):
+        import os
+        name = os.path.basename(self.config_path).replace(".json", "")
+
+        # 1. Ajout du dictionnaire d'émojis
+        emoji_map = {"GLOBAL": "🌍 GLOBAL", "SITE": "🏭 SITE", "WS": "🏢️ WS"}
+        scope_label = emoji_map.get(self.scope, self.scope)
+
+        NavBar(self, f"Config — {scope_label}", name, close_command=self._on_close)
+
+        # 2. On déclare la barre d'action AVANT le corps de la page
+        self._build_action_bar()
+
+        body = tk.Frame(self, bg=Colors.BG_PAGE)
+        body.pack(fill=tk.BOTH, expand=True, padx=18, pady=14)
+
+        self._build_screens_block(body)
+
+    # ───────── Paramètres globaux ─────────
+
+    def _build_params_block(self, parent):
+        card = tk.Frame(parent, bg=Colors.BG_WHITE,
+                        highlightbackground=Colors.BORDER, highlightthickness=1)
+        card.pack(fill=tk.X, pady=(0, 12))
+
+        inner = tk.Frame(card, bg=Colors.BG_WHITE, padx=16, pady=12)
+        inner.pack(fill=tk.X)
+
+        tk.Label(inner, text="Paramètres globaux",
+                 font=(Fonts.MAIN, 10, "bold"), fg=Colors.TXT,
+                 bg=Colors.BG_WHITE).pack(anchor="w")
+
+        params = self.draft.setdefault("parametres_globaux", {})
+
+        row = tk.Frame(inner, bg=Colors.BG_WHITE)
+        row.pack(fill=tk.X, pady=(8, 0))
+        tk.Label(row, text="Nom de l'atelier", font=(Fonts.MAIN, 8, "bold"),
+                 fg=Colors.TXT_3, bg=Colors.BG_WHITE, width=22,
+                 anchor="w").pack(side=tk.LEFT)
+        self.nom_atelier_var = tk.StringVar(value=params.get("nom_atelier", ""))
+        self.nom_atelier_var.trace_add("write", lambda *_: self._mark_dirty())
+        tk.Entry(row, textvariable=self.nom_atelier_var, font=(Fonts.MAIN, 9),
+                 bg=Colors.BG_WHITE, relief="solid", bd=1).pack(
+            side=tk.LEFT, fill=tk.X, expand=True
+        )
+
+        row2 = tk.Frame(inner, bg=Colors.BG_WHITE)
+        row2.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(row2, text="Timeout web (secondes)",
+                 font=(Fonts.MAIN, 8, "bold"), fg=Colors.TXT_3,
+                 bg=Colors.BG_WHITE, width=22, anchor="w").pack(side=tk.LEFT)
+        self.timeout_var = tk.StringVar(value=str(params.get("selenium_timeout", 15)))
+        self.timeout_var.trace_add("write", lambda *_: self._mark_dirty())
+        tk.Entry(row2, textvariable=self.timeout_var, font=(Fonts.MONO, 9),
+                 bg=Colors.BG_WHITE, relief="solid", bd=1, width=8).pack(side=tk.LEFT)
+
+    # ───────── Écrans ─────────
+
+    # def _build_screens_block(self, parent):
+    #     card = tk.Frame(parent, bg=Colors.BG_WHITE,
+    #                     highlightbackground=Colors.BORDER, highlightthickness=1)
+    #     card.pack(fill=tk.BOTH, expand=True)
+    #
+    #     header = tk.Frame(card, bg=Colors.BG_WHITE, padx=16, pady=10)
+    #     header.pack(fill=tk.X)
+    #     tk.Label(header, text="Écrans et affichages",
+    #              font=(Fonts.MAIN, 10, "bold"), fg=Colors.TXT,
+    #              bg=Colors.BG_WHITE).pack(side=tk.LEFT)
+    #     AirbusButton(header, "+ Ajouter un écran", bg=Colors.BLUE,
+    #                  font_size=9, command=self._add_screen).pack(side=tk.RIGHT)
+    #
+    #     tk.Frame(card, bg=Colors.BORDER_LIGHT, height=1).pack(fill=tk.X)
+    #
+    #     canvas = tk.Canvas(card, bg=Colors.BG_WHITE, highlightthickness=0, height=300)
+    #     scrollbar = ttk.Scrollbar(card, orient="vertical", command=canvas.yview)
+    #     self.screens_frame = tk.Frame(canvas, bg=Colors.BG_WHITE, padx=12, pady=8)
+    #     self.screens_frame.bind(
+    #         "<Configure>",
+    #         lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    #     )
+    #     self._screens_window = canvas.create_window(
+    #         (0, 0), window=self.screens_frame, anchor="nw"
+    #     )
+    #     canvas.bind(
+    #         "<Configure>",
+    #         lambda e: canvas.itemconfig(self._screens_window, width=e.width)
+    #     )
+    #     canvas.configure(yscrollcommand=scrollbar.set)
+    #     canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    #     scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    #
+    # def _refresh_screens(self):
+    #     for w in self.screens_frame.winfo_children():
+    #         w.destroy()
+    #
+    #     ecrans = self.draft.get("affichage_config") or []
+    #     if not ecrans:
+    #         tk.Label(self.screens_frame,
+    #                  text="(aucun écran — cliquez sur « + Ajouter un écran »)",
+    #                  font=(Fonts.MAIN, 9), fg=Colors.TXT_3,
+    #                  bg=Colors.BG_WHITE).pack(pady=14)
+    #     else:
+    #         for i, ecran in enumerate(ecrans):
+    #             self._render_screen(i, ecran)
+    #
+    #     # FIX ULTIME : Calcul de la taille FINALE, PUIS ancrage strict en haut
+    #     self.screens_frame.update_idletasks()
+    #     if hasattr(self, 'screens_frame') and hasattr(self.screens_frame, 'master'):
+    #         self.screens_frame.master.configure(scrollregion=self.screens_frame.master.bbox("all"))
+    #         self.screens_frame.master.yview_moveto(0)  # <-- L'ancrage forcé
+    #
+    # def _render_screen(self, idx: int, ecran: dict):
+    #     card = tk.Frame(self.screens_frame, bg=Colors.BG_PAGE,
+    #                     highlightbackground=Colors.BORDER_LIGHT, highlightthickness=1)
+    #     card.pack(fill=tk.X, pady=(0, 8))
+    #
+    #     # Header écran
+    #     header = tk.Frame(card, bg=Colors.BG_PAGE, padx=10, pady=7)
+    #     header.pack(fill=tk.X)
+    #
+    #     tk.Label(header, text=f"Écran {ecran.get('monitor_index', 1)}",
+    #              font=(Fonts.MAIN, 10, "bold"), fg=Colors.NAVY,
+    #              bg=Colors.BG_PAGE).pack(side=tk.LEFT)
+    #
+    #     # Modifier monitor_index
+    #     AirbusButton(header, f"Moniteur : {ecran.get('monitor_index', 1)}",
+    #                  outline=True, font_size=8,
+    #                  command=lambda i=idx: self._edit_monitor_index(i)
+    #                  ).pack(side=tk.LEFT, padx=(12, 0))
+    #
+    #     AirbusButton(header, "✕ écran", bg=Colors.RED, font_size=8,
+    #                  command=lambda i=idx: self._del_screen(i)
+    #                  ).pack(side=tk.RIGHT)
+    #     AirbusButton(header, "+ skill", bg=Colors.BLUE, font_size=8,
+    #                  command=lambda i=idx: self._add_skill_to_screen(i)
+    #                  ).pack(side=tk.RIGHT, padx=(0, 4))
+    #
+    #     # Apps de l'écran
+    #     apps = ecran.get("applications", [])
+    #     if not apps:
+    #         tk.Label(card, text="(aucun skill — cliquez sur « + skill »)",
+    #                  font=(Fonts.MAIN, 8), fg=Colors.TXT_3,
+    #                  bg=Colors.BG_PAGE, padx=10, pady=8).pack(anchor="w")
+    #     else:
+    #         for j, app in enumerate(apps):
+    #             self._render_app_row(card, idx, j, app)
+    #
+    # def _render_app_row(self, parent, screen_idx: int, app_idx: int, app: dict):
+    #     row = tk.Frame(parent, bg=Colors.BG_WHITE,
+    #                     highlightbackground=Colors.BORDER_LIGHT, highlightthickness=1)
+    #     row.pack(fill=tk.X, padx=8, pady=(0, 4))
+    #
+    #     inner = tk.Frame(row, bg=Colors.BG_WHITE, padx=10, pady=6)
+    #     inner.pack(fill=tk.X)
+    #
+    #     tk.Label(inner, text=f"{app_idx + 1}.", font=(Fonts.MONO, 8),
+    #              fg=Colors.TXT_3, bg=Colors.BG_WHITE).pack(side=tk.LEFT)
+    #
+    #     ref = app.get("skill", "?")
+    #     resolved_label = self._resolve_ref_label(ref)
+    #     tk.Label(inner, text=ref, font=(Fonts.MONO, 9, "bold"),
+    #              fg=Colors.BLUE, bg=Colors.BG_WHITE).pack(side=tk.LEFT, padx=(8, 0))
+    #     tk.Label(inner, text=resolved_label, font=(Fonts.MAIN, 8),
+    #              fg=Colors.TXT_3, bg=Colors.BG_WHITE).pack(side=tk.LEFT, padx=(8, 0))
+    #
+    #     # Durée éditable
+    #     duree_var = tk.StringVar(value=str(app.get("temps_affichage", 30)))
+    #
+    #     def _on_duree_change(*_):
+    #         try:
+    #             v = int(duree_var.get())
+    #             if v > 0:
+    #                 self.draft["affichage_config"][screen_idx]["applications"][app_idx]["temps_affichage"] = v
+    #                 self._mark_dirty()
+    #         except ValueError:
+    #             pass
+    #     duree_var.trace_add("write", _on_duree_change)
+    #
+    #     tk.Label(inner, text="durée (s) :", font=(Fonts.MAIN, 8),
+    #              fg=Colors.TXT_2, bg=Colors.BG_WHITE).pack(side=tk.LEFT, padx=(16, 3))
+    #     tk.Entry(inner, textvariable=duree_var, font=(Fonts.MONO, 9),
+    #              width=5, bg=Colors.BG_WHITE, relief="solid", bd=1).pack(side=tk.LEFT)
+    #
+    #     # Actions
+    #     AirbusButton(inner, "✕", bg=Colors.RED, font_size=8,
+    #                  command=lambda s=screen_idx, a=app_idx: self._del_app(s, a)
+    #                  ).pack(side=tk.RIGHT)
+    #     AirbusButton(inner, "▼", outline=True, font_size=8,
+    #                  command=lambda s=screen_idx, a=app_idx: self._move_app(s, a, +1)
+    #                  ).pack(side=tk.RIGHT, padx=(0, 3))
+    #     AirbusButton(inner, "▲", outline=True, font_size=8,
+    #                  command=lambda s=screen_idx, a=app_idx: self._move_app(s, a, -1)
+    #                  ).pack(side=tk.RIGHT, padx=(0, 3))
+    #
+    # def _resolve_ref_label(self, ref: str) -> str:
+    #     """Retourne un label court indiquant si la ref se résout et où."""
+    #     try:
+    #         scope, _path = skills.resolve_skill_ref(
+    #             self.base_dir, ref, self.site, self.workspace
+    #         )
+    #         return f"→ {scope}"
+    #     except Exception:
+    #         return "→ introuvable !"
+    #
+    # # ───────── Actions sur écrans / apps ─────────
+    #
+    # def _add_screen(self):
+    #     existing = {e.get("monitor_index") for e in self.draft.get("affichage_config", [])}
+    #     idx = 1
+    #     while idx in existing:
+    #         idx += 1
+    #     self.draft.setdefault("affichage_config", []).append({
+    #         "monitor_index": idx,
+    #         "applications": [],
+    #     })
+    #     self._mark_dirty()
+    #     self._refresh_screens()
+    #
+    # def _del_screen(self, idx: int):
+    #     if not messagebox.askyesno("Supprimer l'écran",
+    #                                 "Supprimer cet écran et tous ses skills ?",
+    #                                 parent=self):
+    #         return
+    #     del self.draft["affichage_config"][idx]
+    #     self._mark_dirty()
+    #     self._refresh_screens()
+    #
+    # def _edit_monitor_index(self, idx: int):
+    #     current = self.draft["affichage_config"][idx].get("monitor_index", 1)
+    #     new_val = simpledialog.askinteger(
+    #         "Moniteur", "Numéro de moniteur (1, 2, 3…) :",
+    #         parent=self, initialvalue=current, minvalue=1
+    #     )
+    #     if new_val:
+    #         self.draft["affichage_config"][idx]["monitor_index"] = new_val
+    #         self._mark_dirty()
+    #         self._refresh_screens()
+    #
+    # def _add_skill_to_screen(self, screen_idx: int):
+    #     """Ouvre un sélecteur de skill + durée."""
+    #     if not self._available_skills:
+    #         messagebox.showwarning(
+    #             "Aucun skill disponible",
+    #             "Créez d'abord un skill dans la Bibliothèque.",
+    #             parent=self,
+    #         )
+    #         return
+    #
+    #     dlg = tk.Toplevel(self)
+    #     dlg.title("Ajouter un skill à l'écran")
+    #     dlg.configure(bg=Colors.BG_PAGE)
+    #     dlg.transient(self)
+    #     dlg.geometry("420x260")
+    #
+    #     tk.Label(dlg, text="Skill à référencer :", font=(Fonts.MAIN, 10),
+    #              fg=Colors.TXT, bg=Colors.BG_PAGE).pack(anchor="w", padx=20, pady=(14, 4))
+    #
+    #     # Liste des skills avec affichage hiérarchique et Emojis
+    #     values = []
+    #     emoji_map = {"GLOBAL": "🌍", "SITE": "🏭", "WS": "🏢️"}
+    #     for name, info in sorted(self._available_skills.items()):
+    #         label_visuel = emoji_map.get(info['scope'], info['scope'])
+    #         values.append(f"{label_visuel} {name}")
+    #
+    #     combo = ttk.Combobox(dlg, values=values, state="readonly",
+    #                          width=38, style="AB.TCombobox")
+    #     combo.pack(padx=20, fill=tk.X)
+    #     if values:
+    #         combo.set(values[0])
+    #
+    #     # Option pour forcer le scope avec @
+    #     tk.Label(dlg, text="Préfixe de résolution (optionnel) :",
+    #              font=(Fonts.MAIN, 9), fg=Colors.TXT_2,
+    #              bg=Colors.BG_PAGE).pack(anchor="w", padx=20, pady=(10, 2))
+    #
+    #     force_var = tk.StringVar(value="Auto (cascade WS > SITE > GLOBAL)")
+    #     force_combo = ttk.Combobox(dlg, textvariable=force_var, state="readonly",
+    #                                values=["Auto (cascade WS > SITE > GLOBAL)",
+    #                                        "🏢 @WS (forcer workspace)",
+    #                                        "🏭 @SITE (forcer site)",
+    #                                        "🌍 @GLOBAL (forcer global)"],
+    #                                width=38, style="AB.TCombobox")
+    #     force_combo.pack(padx=20, fill=tk.X)
+    #
+    #     # Durée
+    #     tk.Label(dlg, text="Durée d'affichage (s) :", font=(Fonts.MAIN, 9),
+    #              fg=Colors.TXT_2, bg=Colors.BG_PAGE).pack(anchor="w", padx=20, pady=(10, 2))
+    #
+    #     duree_var = tk.StringVar(value="30")
+    #     tk.Entry(dlg, textvariable=duree_var, font=(Fonts.MONO, 10),
+    #              width=10, bg=Colors.BG_WHITE, relief="solid", bd=1
+    #              ).pack(padx=20, anchor="w")
+    #
+    #     # --- DÉBUT DU REMPLACEMENT ---
+    #     result = {"ok": False, "raw": "", "force": "", "duree": "30"}
+    #
+    #     def _ok():
+    #         # On sauvegarde les valeurs ICI, pendant que la fenêtre existe encore !
+    #         result["ok"] = True
+    #         result["raw"] = combo.get()
+    #         result["force"] = force_var.get()
+    #         result["duree"] = duree_var.get()
+    #         dlg.destroy()
+    #
+    #     btns = tk.Frame(dlg, bg=Colors.BG_PAGE, padx=20, pady=14)
+    #     btns.pack(side=tk.BOTTOM, anchor="e")
+    #     AirbusButton(btns, "Ajouter", bg=Colors.GREEN, command=_ok).pack(side=tk.LEFT, padx=(0, 6))
+    #     AirbusButton(btns, "Annuler", outline=True, command=dlg.destroy).pack(side=tk.LEFT)
+    #
+    #     dlg.grab_set()
+    #     self.wait_window(dlg)
+    #
+    #     if not result["ok"]:
+    #         return
+    #
+    #     raw = result["raw"]
+    #     if not raw:
+    #         return
+    #
+    #     name = raw.split(" ", 1)[-1].strip()
+    #
+    #     # Préfixe
+    #     prefix = ""
+    #     f = result["force"]
+    #     if "@WS" in f:
+    #         prefix = "@WS/"
+    #     elif "@SITE" in f:
+    #         prefix = "@SITE/"
+    #     elif "@GLOBAL" in f:
+    #         prefix = "@GLOBAL/"
+    #
+    #     try:
+    #         duree = max(1, int(result["duree"]))
+    #     except ValueError:
+    #         duree = 30
+    #
+    #     self.draft["affichage_config"][screen_idx].setdefault("applications", []).append({
+    #         "skill": prefix + name,
+    #         "temps_affichage": duree,
+    #     })
+    #     self._mark_dirty()
+    #     self._refresh_screens()
+    #
+    # def _del_app(self, screen_idx: int, app_idx: int):
+    #     del self.draft["affichage_config"][screen_idx]["applications"][app_idx]
+    #     self._mark_dirty()
+    #     self._refresh_screens()
+    #
+    # def _move_app(self, screen_idx: int, app_idx: int, delta: int):
+    #     apps = self.draft["affichage_config"][screen_idx]["applications"]
+    #     new_idx = app_idx + delta
+    #     if 0 <= new_idx < len(apps):
+    #         apps[app_idx], apps[new_idx] = apps[new_idx], apps[app_idx]
+    #         self._mark_dirty()
+    #         self._refresh_screens()
+    #
+    # # ───────── Save / Close ─────────
+    #
+    # def _build_action_bar(self):
+    #     bar = tk.Frame(self, bg=Colors.BG_PAGE)
+    #     bar.pack(side=tk.BOTTOM, fill=tk.X, padx=18, pady=(10, 18))
+    #
+    #     AirbusButton(bar, "💾 Sauvegarder", bg=Colors.GREEN,
+    #                  command=self._save).pack(side=tk.RIGHT, padx=(6, 0))
+    #     AirbusButton(bar, "Annuler", outline=True,
+    #                  command=self._on_close).pack(side=tk.RIGHT)
+    #
+    # def _mark_dirty(self):
+    #     self._dirty = True
+    #
+    # def _on_close(self):
+    #     if self._dirty:
+    #         if not messagebox.askyesno(
+    #             "Modifications non sauvegardées",
+    #             "Fermer sans sauvegarder ?", parent=self
+    #         ):
+    #             return
+    #     self.destroy()
+    #
+    # @show_loading
+    # def _save(self):
+    #     # Synchroniser paramètres globaux (valeurs par défaut invisibles)
+    #     params = self.draft.setdefault("parametres_globaux", {})
+    #     params["selenium_timeout"] = 15
+    #
+    #     # On nettoie l'ancien nom_atelier s'il était présent
+    #     if "nom_atelier" in params:
+    #         del params["nom_atelier"]
+    #
+    #     # Nettoyer écrans vides
+    #     ecrans = [e for e in self.draft.get("affichage_config", []) if e.get("applications")]
+    #     self.draft["affichage_config"] = ecrans
+    #
+    #     if not ecrans:
+    #         if not messagebox.askyesno("Configuration vide", "Aucun écran avec skills. Sauvegarder quand même ?",
+    #                                    parent=self):
+    #             return
+    #
+    #     self.draft["type"] = "kiosk"
+    #     self.draft.pop("items", None)
+    #
+    #     try:
+    #         cfg.save_json(self.config_path, self.draft)
+    #     except Exception as e:
+    #         messagebox.showerror("Erreur", f"Impossible de sauvegarder : {e}", parent=self)
+    #         return
+    #
+    #     logger.info(f"Configuration sauvegardée : {self.config_path}")
+    #     self._dirty = False
+    #     if self.on_saved:
+    #         try:
+    #             self.on_saved()
+    #         except Exception:
+    #             pass
+    #     self.destroy()
+
+    def _build_screens_block(self, parent):
+        card = tk.Frame(parent, bg=Colors.BG_WHITE, highlightbackground=Colors.BORDER, highlightthickness=1)
+        card.pack(fill=tk.BOTH, expand=True)
+
+        header = tk.Frame(card, bg=Colors.BG_WHITE, padx=16, pady=10)
+        header.pack(fill=tk.X)
+        tk.Label(header, text="Séquence de skills", font=(Fonts.MAIN, 10, "bold"), fg=Colors.TXT,
+                 bg=Colors.BG_WHITE).pack(side=tk.LEFT)
+        AirbusButton(header, "+ Ajouter un skill", bg=Colors.BLUE, font_size=9, command=self._add_skill).pack(
+            side=tk.RIGHT)
+
+        tk.Frame(card, bg=Colors.BORDER_LIGHT, height=1).pack(fill=tk.X)
+
+        canvas = tk.Canvas(card, bg=Colors.BG_WHITE, highlightthickness=0, height=300)
+        scrollbar = ttk.Scrollbar(card, orient="vertical", command=canvas.yview)
+        self.screens_frame = tk.Frame(canvas, bg=Colors.BG_WHITE, padx=12, pady=8)
+        self.screens_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        self._screens_window = canvas.create_window((0, 0), window=self.screens_frame, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(self._screens_window, width=e.width))
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _refresh_screens(self):
+        for w in self.screens_frame.winfo_children(): w.destroy()
+
+        apps = self.draft.get("applications") or []
+        if not apps:
+            tk.Label(self.screens_frame, text="(aucun skill — cliquez sur « + Ajouter un skill »)",
+                     font=(Fonts.MAIN, 9), fg=Colors.TXT_3, bg=Colors.BG_WHITE).pack(pady=14)
+        else:
+            for j, app in enumerate(apps): self._render_app_row(self.screens_frame, j, app)
+
+        self.screens_frame.update_idletasks()
+        if hasattr(self, 'screens_frame') and hasattr(self.screens_frame, 'master'):
+            self.screens_frame.master.configure(scrollregion=self.screens_frame.master.bbox("all"))
+            self.screens_frame.master.yview_moveto(0)
+
+    def _skill_type(self, ref: str) -> str:
+        """Type du skill référencé ('web' | 'desktop_app' | 'ppt').
+
+        Renvoie 'web' par défaut (ou si le skill est introuvable) : le minutage
+        standard 'durée (s)' reste alors la valeur sûre.
+        """
+        try:
+            return skills.load_skill(self.base_dir, ref, self.site, self.workspace).get("type", "web")
+        except Exception:
+            return "web"
+
+    def _render_web_timing(self, inner, app_idx: int, app: dict):
+        """Champ 'durée (s)' pour un élément web / desktop_app (comportement existant)."""
+        duree_var = tk.StringVar(value=str(app.get("temps_affichage", 30)))
+
+        def _on_duree_change(*_):
+            try:
+                v = int(duree_var.get())
+                if v > 0:
+                    self.draft["applications"][app_idx]["temps_affichage"] = v
+                    self._mark_dirty()
+            except ValueError:
+                pass
+
+        duree_var.trace_add("write", _on_duree_change)
+        tk.Label(inner, text="durée (s) :", font=(Fonts.MAIN, 8), fg=Colors.TXT_2,
+                 bg=Colors.BG_PAGE).pack(side=tk.LEFT, padx=(16, 3))
+        tk.Entry(inner, textvariable=duree_var, font=(Fonts.MONO, 9), width=5,
+                 bg=Colors.BG_WHITE, relief="solid", bd=1).pack(side=tk.LEFT)
+
+    def _render_ppt_timing(self, inner, app_idx: int, app: dict):
+        """Champs 'durée/diapo' + 'boucles' pour un diaporama (ppt).
+
+        Le temps d'affichage de l'élément est recalculé à la compilation :
+        durée/diapo × nb de diapos × nb de boucles.
+        """
+        diapo_var = tk.StringVar(value=str(app.get("duree_diapo", 8)))
+        boucles_var = tk.StringVar(value=str(app.get("boucles", 1)))
+
+        def _on_diapo_change(*_):
+            try:
+                v = int(diapo_var.get())
+                if v >= 1:
+                    self.draft["applications"][app_idx]["duree_diapo"] = v
+                    self._mark_dirty()
+            except ValueError:
+                pass
+
+        def _on_boucles_change(*_):
+            try:
+                v = int(boucles_var.get())
+                if v >= 1:
+                    self.draft["applications"][app_idx]["boucles"] = v
+                    self._mark_dirty()
+            except ValueError:
+                pass
+
+        diapo_var.trace_add("write", _on_diapo_change)
+        boucles_var.trace_add("write", _on_boucles_change)
+        tk.Label(inner, text="durée/diapo (s) :", font=(Fonts.MAIN, 8), fg=Colors.TXT_2,
+                 bg=Colors.BG_PAGE).pack(side=tk.LEFT, padx=(16, 3))
+        tk.Entry(inner, textvariable=diapo_var, font=(Fonts.MONO, 9), width=4,
+                 bg=Colors.BG_WHITE, relief="solid", bd=1).pack(side=tk.LEFT)
+        tk.Label(inner, text="boucles :", font=(Fonts.MAIN, 8), fg=Colors.TXT_2,
+                 bg=Colors.BG_PAGE).pack(side=tk.LEFT, padx=(10, 3))
+        tk.Entry(inner, textvariable=boucles_var, font=(Fonts.MONO, 9), width=3,
+                 bg=Colors.BG_WHITE, relief="solid", bd=1).pack(side=tk.LEFT)
+
+    def _render_app_row(self, parent, app_idx: int, app: dict):
+        row = tk.Frame(parent, bg=Colors.BG_PAGE, highlightbackground=Colors.BORDER_LIGHT, highlightthickness=1)
+        row.pack(fill=tk.X, padx=8, pady=(0, 4))
+        inner = tk.Frame(row, bg=Colors.BG_PAGE, padx=10, pady=6)
+        inner.pack(fill=tk.X)
+
+        tk.Label(inner, text=f"{app_idx + 1}.", font=(Fonts.MONO, 8), fg=Colors.TXT_3, bg=Colors.BG_PAGE).pack(
+            side=tk.LEFT)
+        ref = app.get("skill", "?")
+
+        try:
+            scope, _ = skills.resolve_skill_ref(self.base_dir, ref, self.site, self.workspace)
+            lbl = f"→ {scope}"
+        except Exception:
+            lbl = "→ introuvable !"
+
+        tk.Label(inner, text=ref, font=(Fonts.MONO, 9, "bold"), fg=Colors.BLUE, bg=Colors.BG_PAGE).pack(side=tk.LEFT,
+                                                                                                        padx=(8, 0))
+        tk.Label(inner, text=lbl, font=(Fonts.MAIN, 8), fg=Colors.TXT_3, bg=Colors.BG_PAGE).pack(side=tk.LEFT,
+                                                                                                 padx=(8, 0))
+
+        # Minutage adapté au type : ppt → durée/diapo + boucles, sinon → durée (s)
+        if self._skill_type(ref) == "ppt":
+            self._render_ppt_timing(inner, app_idx, app)
+        else:
+            self._render_web_timing(inner, app_idx, app)
+
+        AirbusButton(inner, "✕", bg=Colors.RED, font_size=8, command=lambda a=app_idx: self._del_app(a)).pack(
+            side=tk.RIGHT)
+        AirbusButton(inner, "▼", outline=True, font_size=8, command=lambda a=app_idx: self._move_app(a, +1)).pack(
+            side=tk.RIGHT, padx=(0, 3))
+        AirbusButton(inner, "▲", outline=True, font_size=8, command=lambda a=app_idx: self._move_app(a, -1)).pack(
+            side=tk.RIGHT, padx=(0, 3))
+
+    def _add_skill(self):
+        if not self._available_skills:
+            messagebox.showwarning("Aucun skill", "Créez d'abord un skill.", parent=self)
+            return
+
+        # 🚨 FIX ANTI-FREEZE : On relâche la fenêtre parente
+        self.grab_release()
+        self.attributes('-topmost', False)
+
+        # --- Nouvelle fenêtre Airbus ---
+        dlg = tk.Toplevel(self)
+        apply_borderless(dlg)
+        dlg.configure(bg=Colors.BG_PAGE)
+        dlg.attributes('-topmost', True)
+        dlg.transient(self)
+
+        NavBar(dlg, "Ajout requis", "Ajouter un skill", close_command=dlg.destroy, show_close=True)
+
+        body = tk.Frame(dlg, bg=Colors.BG_PAGE, padx=20, pady=20)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(body, text="Skill à référencer :", font=(Fonts.MAIN, 10), fg=Colors.TXT, bg=Colors.BG_PAGE).pack(
+            anchor="w", pady=(0, 4))
+
+        # Emojis automatiques
+        emoji_map = {"GLOBAL": "🌍", "SITE": "🏭", "WS": "🏢️"}
+        values = [f"{emoji_map.get(info['scope'], info['scope'])} {name}" for name, info in
+                  sorted(self._available_skills.items())]
+
+        combo = ttk.Combobox(body, values=values, state="readonly", width=38, style="AB.TCombobox")
+        combo.pack(fill=tk.X)
+        if values: combo.set(values[0])
+
+        tk.Label(body, text="Préfixe (optionnel) :", font=(Fonts.MAIN, 9), fg=Colors.TXT_2, bg=Colors.BG_PAGE).pack(
+            anchor="w", pady=(10, 2))
+        force_var = tk.StringVar(value="Auto")
+        force_combo = ttk.Combobox(body, textvariable=force_var, state="readonly",
+                                   values=["Auto", "🏢️ @WS", "🏭 @SITE", "🌍 @GLOBAL"], width=38, style="AB.TCombobox")
+        force_combo.pack(fill=tk.X)
+
+        # Minutage adapté au type de skill sélectionné (rafraîchi à chaque choix).
+        timing_holder = tk.Frame(body, bg=Colors.BG_PAGE)
+        timing_holder.pack(fill=tk.X)
+
+        duree_var = tk.StringVar(value="30")
+        diapo_var = tk.StringVar(value="8")
+        boucles_var = tk.StringVar(value="1")
+        ctx = {"type": "web"}
+
+        def _render_timing(event=None):
+            for child in timing_holder.winfo_children():
+                child.destroy()
+            raw = combo.get()
+            name_sel = raw.split(" ", 1)[-1].strip() if raw else ""
+            ctx["type"] = self._skill_type(name_sel) if name_sel else "web"
+
+            if ctx["type"] == "ppt":
+                tk.Label(timing_holder, text="Durée par diapo (s) :", font=(Fonts.MAIN, 9),
+                         fg=Colors.TXT_2, bg=Colors.BG_PAGE).pack(anchor="w", pady=(10, 2))
+                tk.Entry(timing_holder, textvariable=diapo_var, font=(Fonts.MONO, 10),
+                         bg=Colors.BG_WHITE, relief="solid", bd=1, width=10).pack(anchor="w", ipady=2)
+                tk.Label(timing_holder, text="Boucles du diaporama :", font=(Fonts.MAIN, 9),
+                         fg=Colors.TXT_2, bg=Colors.BG_PAGE).pack(anchor="w", pady=(10, 2))
+                tk.Entry(timing_holder, textvariable=boucles_var, font=(Fonts.MONO, 10),
+                         bg=Colors.BG_WHITE, relief="solid", bd=1, width=10).pack(anchor="w", ipady=2)
+            else:
+                tk.Label(timing_holder, text="Durée (s) :", font=(Fonts.MAIN, 9),
+                         fg=Colors.TXT_2, bg=Colors.BG_PAGE).pack(anchor="w", pady=(10, 2))
+                tk.Entry(timing_holder, textvariable=duree_var, font=(Fonts.MONO, 10),
+                         bg=Colors.BG_WHITE, relief="solid", bd=1, width=10).pack(anchor="w", ipady=2)
+
+            # Réajuste la hauteur si l'utilisateur change de type après ouverture.
+            if timing_holder.winfo_ismapped():
+                dlg.update_idletasks()
+                dlg.geometry(f"460x{dlg.winfo_reqheight()}")
+
+        combo.bind("<<ComboboxSelected>>", _render_timing)
+        _render_timing()
+
+        result = {"ok": False, "raw": "", "force": "", "type": "web",
+                  "duree": "30", "duree_diapo": "8", "boucles": "1"}
+
+        def _ok(event=None):
+            result.update({"ok": True, "raw": combo.get(), "force": force_var.get(),
+                           "type": ctx["type"], "duree": duree_var.get(),
+                           "duree_diapo": diapo_var.get(), "boucles": boucles_var.get()})
+            dlg.destroy()
+
+        # Bindings clavier
+        dlg.bind('<Return>', _ok)
+        dlg.bind('<Escape>', lambda e: dlg.destroy())
+
+        # Boutons standardisés
+        btns = tk.Frame(dlg, bg=Colors.BG_PAGE, padx=20, pady=15)
+        btns.pack(side=tk.BOTTOM, fill=tk.X)
+        AirbusButton(btns, "Valider", bg=Colors.GREEN, font_size=9, command=_ok).pack(side=tk.RIGHT, ipady=2)
+        AirbusButton(btns, "Annuler", outline=True, font_size=9, command=dlg.destroy).pack(side=tk.RIGHT, padx=(0, 10),
+                                                                                           ipady=2)
+
+        # Calcul dynamique
+        dlg.update_idletasks()
+        auto_w = 460
+        auto_h = dlg.winfo_reqheight()
+        x = self.winfo_rootx() + (self.winfo_width() // 2) - (auto_w // 2)
+        y = self.winfo_rooty() + (self.winfo_height() // 2) - (auto_h // 2)
+        dlg.geometry(f"{auto_w}x{auto_h}+{x}+{y}")
+
+        # 🚨 FIX ANTI-FREEZE : Sécurisation de l'affichage avant verrouillage
+        dlg.deiconify()
+        dlg.lift()
+        dlg.grab_set()
+        dlg.focus_force()
+
+        self.wait_window(dlg)
+
+        # 🚨 FIX ANTI-FREEZE : On restaure la fenêtre parente
+        self.attributes('-topmost', True)
+        self.grab_set()
+        self.focus_force()
+
+        if not result["ok"] or not result["raw"]: return
+        name = result["raw"].split(" ", 1)[-1].strip()
+
+        f = result["force"]
+        if "@WS" in f:
+            prefix = "@WS/"
+        elif "@SITE" in f:
+            prefix = "@SITE/"
+        elif "@GLOBAL" in f:
+            prefix = "@GLOBAL/"
+        else:
+            prefix = ""
+
+        if result.get("type") == "ppt":
+            diapo = int(result["duree_diapo"]) if result["duree_diapo"].isdigit() and int(result["duree_diapo"]) >= 1 else 8
+            boucles = int(result["boucles"]) if result["boucles"].isdigit() and int(result["boucles"]) >= 1 else 1
+            self.draft.setdefault("applications", []).append(
+                {"skill": prefix + name, "duree_diapo": diapo, "boucles": boucles})
+        else:
+            duree = int(result["duree"]) if result["duree"].isdigit() else 30
+            self.draft.setdefault("applications", []).append(
+                {"skill": prefix + name, "temps_affichage": duree})
+        self._mark_dirty()
+        self._refresh_screens()
+
+    def _del_app(self, app_idx: int):
+        del self.draft["applications"][app_idx]
+        self._mark_dirty()
+        self._refresh_screens()
+
+    def _move_app(self, app_idx: int, delta: int):
+        apps = self.draft["applications"]
+        new_idx = app_idx + delta
+        if 0 <= new_idx < len(apps):
+            apps[app_idx], apps[new_idx] = apps[new_idx], apps[app_idx]
+            self._mark_dirty()
+            self._refresh_screens()
+
+    def _build_action_bar(self):
+        bar = tk.Frame(self, bg=Colors.BG_PAGE)
+        bar.pack(side=tk.BOTTOM, fill=tk.X, padx=18, pady=(10, 18))
+        AirbusButton(bar, "💾 Sauvegarder", bg=Colors.GREEN, command=self._save).pack(side=tk.RIGHT, padx=(6, 0))
+        AirbusButton(bar, "Annuler", outline=True, command=self._on_close).pack(side=tk.RIGHT)
+
+    def _mark_dirty(self):
+        self._dirty = True
+
+    def _on_close(self):
+        if self._dirty and not messagebox.askyesno("Modifications non sauvegardées", "Fermer sans sauvegarder ?",
+                                                   parent=self): return
+        self.destroy()
+
+    @show_loading
+    def _save(self):
+        params = self.draft.setdefault("parametres_globaux", {})
+        params["selenium_timeout"] = 15
+        if "nom_atelier" in params: del params["nom_atelier"]
+
+        if not self.draft.get("applications"):
+            if not messagebox.askyesno("Vide", "Aucun skill. Sauvegarder quand même ?", parent=self): return
+
+        self.draft["type"] = "kiosk"
+        self.draft.pop("items", None)
+        self.draft.pop("affichage_config", None)  # Nettoie les anciennes structures
+
+        try:
+            cfg.save_json(self.config_path, self.draft)
+            self._dirty = False
+            if self.on_saved: self.on_saved()
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Erreur", str(e), parent=self)
+

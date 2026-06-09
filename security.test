@@ -1,0 +1,523 @@
+
+"""
+security.py — Module de sécurité pour Kiosk Engine.
+
+Contient :
+- HMAC-SHA256 pour authentifier les commandes distantes (.cmd)
+- Chiffrement / déchiffrement des identifiants (DPAPI Windows)
+- Validation des séquences send_keys (blacklist de patterns dangereux)
+- Whitelist de domaines, exécutables, variables d'environnement
+- Vérification d'intégrité de ChromeDriver (hash SHA-256)
+"""
+
+import os
+import re
+import hmac
+import time
+import hashlib
+import ipaddress
+import threading
+from typing import Optional
+from urllib.parse import urlparse
+from loguru import logger
+
+# Préfixe pour les identifiants chiffrés dans les configs
+ENC_PREFIX = "ENC:"
+
+
+# ══════════════════════════════════
+# HMAC — AUTHENTIFICATION DES COMMANDES
+# ══════════════════════════════════
+
+def _get_hmac_secret(global_config: dict) -> Optional[bytes]:
+    """Récupère le secret HMAC (clé directe ou variable d'environnement)."""
+    # On lit la valeur configurée dans l'Admin
+    configured_val = global_config.get("security", {}).get("hmac_secret_env", "")
+
+    if not configured_val:
+        logger.warning("Aucun secret HMAC configuré. Les commandes distantes ne seront PAS authentifiées.")
+        return None
+    secret = os.environ.get(configured_val)
+
+    if not secret:
+        secret = configured_val
+
+    return secret.encode('utf-8')
+
+
+def sign_command(command_text: str, global_config: dict) -> str:
+    """
+    Signe une commande avec HMAC-SHA256 + horodatage.
+
+    Format retourné :
+        RESTART_WITH config.json
+        TIMESTAMP:1719500000
+        HMAC:a3f2b8c9...
+    """
+    secret = _get_hmac_secret(global_config)
+    timestamp = str(int(time.time()))
+    payload = f"{command_text}\nTIMESTAMP:{timestamp}"
+
+    if secret:
+        sig = hmac.new(secret, payload.encode('utf-8'), hashlib.sha256).hexdigest()
+        return f"{payload}\nHMAC:{sig}"
+    else:
+        return f"{payload}\nHMAC:UNSIGNED"
+
+
+def verify_command(file_content: str, global_config: dict, max_age_seconds: int = 60) -> Optional[str]:
+    """
+    Vérifie une commande signée. Retourne la commande si valide, None sinon.
+
+    Vérifie :
+    - Signature HMAC
+    - Horodatage (anti-rejeu, max 60s par défaut)
+    """
+    lines = file_content.strip().split('\n')
+    if len(lines) < 3:
+        # Format ancien (non signé) — accepter si pas de secret configuré
+        secret = _get_hmac_secret(global_config)
+        if secret is None:
+            return lines[0].strip() if lines else None
+        logger.warning("Commande non signée rejetée (HMAC configuré).")
+        return None
+
+    command = lines[0].strip()
+    timestamp_line = lines[1].strip()
+    hmac_line = lines[2].strip()
+
+    if not timestamp_line.startswith("TIMESTAMP:") or not hmac_line.startswith("HMAC:"):
+        logger.warning("Format de commande invalide.")
+        return None
+
+    received_hmac = hmac_line.split("HMAC:", 1)[1]
+
+    # Vérification de l'horodatage
+    try:
+        ts = int(timestamp_line.split("TIMESTAMP:", 1)[1])
+        age = abs(time.time() - ts)
+        if age > max_age_seconds:
+            logger.warning(f"Commande expirée (âge: {age:.0f}s, max: {max_age_seconds}s).")
+            return None
+    except (ValueError, IndexError):
+        logger.warning("Horodatage invalide dans la commande.")
+        return None
+
+    # Vérification HMAC
+    secret = _get_hmac_secret(global_config)
+    if secret is None:
+        if received_hmac == "UNSIGNED":
+            return command
+        logger.warning("HMAC présent mais aucun secret configuré.")
+        return command  # Accepter en mode dégradé
+
+    payload = f"{command}\n{timestamp_line}"
+    expected = hmac.new(secret, payload.encode('utf-8'), hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(received_hmac, expected):
+        logger.warning(f"HMAC invalide pour la commande '{command}'. Rejet.")
+        return None
+
+    return command
+
+
+# ══════════════════════════════════
+# CHIFFREMENT DES IDENTIFIANTS (DPAPI)
+# ══════════════════════════════════
+
+# def encrypt_credential(plaintext: str) -> str:
+#     """Chiffre un identifiant via DPAPI Windows. Retourne ENC:base64."""
+#     try:
+#         import win32crypt
+#         import base64
+#         encrypted = win32crypt.CryptProtectData(
+#             plaintext.encode('utf-8'), None, None, None, None, 0
+#         )
+#         return ENC_PREFIX + base64.b64encode(encrypted).decode('ascii')
+#     except ImportError:
+#         logger.warning("win32crypt non disponible. Identifiant stocké en clair.")
+#         return plaintext
+#     except Exception as e:
+#         logger.error(f"Erreur chiffrement DPAPI: {e}")
+#         return plaintext
+#
+#
+# def decrypt_credential(value: str) -> str:
+#     """Déchiffre un identifiant ENC:base64 via DPAPI. Passe-through si pas préfixé."""
+#     if not value.startswith(ENC_PREFIX):
+#         return value  # Pas chiffré, retourner tel quel
+#     try:
+#         import win32crypt
+#         import base64
+#         encrypted = base64.b64decode(value[len(ENC_PREFIX):])
+#         decrypted = win32crypt.CryptUnprotectData(encrypted, None, None, None, 0)
+#         return decrypted[1].decode('utf-8')
+#     except ImportError:
+#         logger.error("win32crypt non disponible. Impossible de déchiffrer.")
+#         return ""
+#     except Exception as e:
+#         logger.error(f"Erreur déchiffrement DPAPI: {e}")
+#         return ""
+#
+#
+# def resolve_credentials(etape: dict) -> dict:
+#     """Résout les identifiants chiffrés dans une étape smart_login."""
+#     if etape.get("action") != "smart_login":
+#         return etape
+#
+#     creds = etape.get("identifiants", {})
+#     resolved = dict(etape)
+#     resolved["identifiants"] = {
+#         "user": decrypt_credential(creds.get("user", "")),
+#         "pass": decrypt_credential(creds.get("pass", "")),
+#     }
+#     return resolved
+
+
+# ══════════════════════════════════
+# CHIFFREMENT DES IDENTIFIANTS (FERNET)
+# ══════════════════════════════════
+from cryptography.fernet import Fernet
+
+_FERNET_INSTANCE = None
+
+def _get_fernet(base_dir: str) -> Fernet:
+    """Récupère ou génère la clé Maître Fernet."""
+    global _FERNET_INSTANCE
+    if _FERNET_INSTANCE:
+        return _FERNET_INSTANCE
+
+    # 1. Vérifier si la clé est en variable d'environnement (Priorité haute)
+    env_key = os.environ.get("KIOSK_MASTER_KEY")
+    if env_key:
+        try:
+            _FERNET_INSTANCE = Fernet(env_key.encode('utf-8'))
+            return _FERNET_INSTANCE
+        except Exception as e:
+            logger.error(f"Clé KIOSK_MASTER_KEY invalide : {e}")
+
+    # 2. Vérifier/Créer le fichier local dans base_dir
+    key_path = os.path.join(base_dir, "kiosk_master.key")
+    if os.path.exists(key_path):
+        with open(key_path, 'r', encoding='utf-8') as f:
+            key = f.read().strip()
+        try:
+            _FERNET_INSTANCE = Fernet(key.encode('utf-8'))
+            return _FERNET_INSTANCE
+        except Exception as e:
+            logger.error(f"Clé dans {key_path} invalide : {e}")
+            raise
+    else:
+        # Génération de la clé pour la toute première fois
+        logger.warning(f"Génération d'une nouvelle clé Maître dans : {key_path}")
+        logger.warning("ATTENTION : Ne perdez pas ce fichier, sinon les identifiants seront illisibles !")
+        new_key = Fernet.generate_key()
+        with open(key_path, 'w', encoding='utf-8') as f:
+            f.write(new_key.decode('utf-8'))
+        _FERNET_INSTANCE = Fernet(new_key)
+        return _FERNET_INSTANCE
+
+def encrypt_credential(plaintext: str, base_dir: str) -> str:
+    """Chiffre une chaîne de caractères via Fernet."""
+    if not plaintext or plaintext.startswith(ENC_PREFIX):
+        return plaintext
+    try:
+        f = _get_fernet(base_dir)
+        encrypted = f.encrypt(plaintext.encode('utf-8'))
+        return ENC_PREFIX + encrypted.decode('utf-8')
+    except Exception as e:
+        logger.error(f"Erreur de chiffrement : {e}")
+        return plaintext
+
+def decrypt_credential(value: str, base_dir: str) -> str:
+    """Déchiffre une chaîne de caractères ENC:... via Fernet."""
+    if not value or not value.startswith(ENC_PREFIX):
+        return value
+    try:
+        f = _get_fernet(base_dir)
+        token = value[len(ENC_PREFIX):].encode('utf-8')
+        decrypted = f.decrypt(token)
+        return decrypted.decode('utf-8')
+    except Exception as e:
+        logger.error(f"Erreur de déchiffrement : {e}")
+        return ""
+
+def resolve_credentials(etape: dict, base_dir: str) -> dict:
+    """Résout les identifiants chiffrés dans une étape smart_login."""
+    if etape.get("action") != "smart_login":
+        return etape
+
+    creds = etape.get("identifiants", {})
+    resolved = dict(etape)
+    resolved["identifiants"] = {
+        "user": decrypt_credential(creds.get("user", ""), base_dir),
+        "pass": decrypt_credential(creds.get("pass", ""), base_dir),
+    }
+    return resolved
+
+
+
+# ══════════════════════════════════
+# VALIDATION DES SÉQUENCES SEND_KEYS
+# ══════════════════════════════════
+
+# Patterns dangereux dans les valeurs send_keys
+_SENDKEYS_BLACKLIST = [
+    r'\^\{ESC\}',
+    r'\^r',
+    r'#\{r\}',
+    r'%\{F4\}',
+    r'(?i)cmd',
+    r'(?i)powershell',
+    r'(?i)regedit',
+    r'(?i)net\s+user',
+    r'(?i)net\s+localgroup',
+    r'(?i)certutil',
+    r'(?i)mshta',
+    r'(?i)wscript',
+    r'(?i)cscript',
+    r'(?i)bitsadmin',
+    r'(?i)rundll32',
+]
+
+_SENDKEYS_PATTERNS = [re.compile(p) for p in _SENDKEYS_BLACKLIST]
+
+# Longueur max par valeur send_keys et nombre max d'étapes
+MAX_SENDKEYS_LENGTH = 250
+MAX_SEQUENCE_STEPS = 30
+
+
+def validate_sendkeys_sequence(sequence: list) -> list[str]:
+    """
+    Valide une séquence d'actions desktop.
+    Retourne une liste d'erreurs (vide si OK).
+    """
+    errors = []
+
+    if len(sequence) > MAX_SEQUENCE_STEPS:
+        errors.append(f"Séquence trop longue ({len(sequence)} étapes, max {MAX_SEQUENCE_STEPS}).")
+
+    for i, etape in enumerate(sequence):
+        action = etape.get("action", "")
+        value = etape.get("value", "")
+
+        if action == "send_keys":
+            if len(value) > MAX_SENDKEYS_LENGTH:
+                errors.append(f"Étape {i}: valeur send_keys trop longue ({len(value)} chars).")
+
+            for pattern in _SENDKEYS_PATTERNS:
+                if pattern.search(value):
+                    errors.append(f"Étape {i}: pattern interdit détecté dans send_keys ('{value[:40]}...').")
+                    break
+
+    return errors
+
+
+# ══════════════════════════════════
+# WHITELIST DOMAINES (URLs Web)
+# ══════════════════════════════════
+
+def validate_url_domain(url: str, allowed_domains: list[str]) -> bool:
+    """
+    Vérifie qu'une URL appartient à un domaine autorisé.
+    Supporte les wildcards (*.entreprise.com) et les plages IP.
+    Si la whitelist est vide, tout est autorisé (mode dégradé).
+    """
+    if not allowed_domains:
+        return True
+
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+    except Exception:
+        return False
+
+    for pattern in allowed_domains:
+        pattern = pattern.strip().lower()
+        host_lower = host.lower()
+
+        if pattern.startswith("*."):
+            suffix = pattern[1:]  # ".entreprise.com"
+            if host_lower.endswith(suffix) or host_lower == pattern[2:]:
+                return True
+        elif "/" in pattern:
+            # Plage CIDR (ex: "10.0.0.0/8")
+            try:
+                network = ipaddress.ip_network(pattern, strict=False)
+                host_ip = ipaddress.ip_address(host_lower)
+                if host_ip in network:
+                    return True
+            except ValueError:
+                # Le pattern ou le host n'est pas une adresse IP valide
+                pass
+        else:
+            if host_lower == pattern:
+                return True
+
+    return False
+
+
+# ══════════════════════════════════
+# WHITELIST EXÉCUTABLES
+# ══════════════════════════════════
+
+# Commandes shell dangereuses dans les chemins d'exécutables
+_SHELL_CHARS = ['&', '|', ';', '&&', '||', '>', '<', '`', '$', '%']
+_SHELL_COMMANDS = ['cmd', 'cmd.exe', 'powershell', 'powershell.exe',
+                   'certutil', 'mshta', 'wscript', 'cscript', 'bitsadmin',
+                   'rundll32']
+
+
+def validate_executable(source: str, allowed_executables: list[str]) -> tuple[bool, str]:
+    """
+    Valide un chemin d'exécutable desktop_app.
+    Retourne (is_valid, error_message).
+    """
+    # Vérifier les caractères de chaînage shell
+    for char in _SHELL_CHARS:
+        if char in source:
+            return False, f"Caractère interdit '{char}' dans le chemin d'exécutable."
+
+    # Vérifier les commandes shell
+    source_lower = source.lower().strip()
+    for cmd in _SHELL_COMMANDS:
+        if source_lower.startswith(cmd + " ") or source_lower == cmd:
+            return False, f"Commande shell interdite : '{cmd}'."
+
+    # Vérifier la whitelist (si configurée)
+    if allowed_executables:
+        source_normalized = os.path.normpath(source).lower()
+        for allowed in allowed_executables:
+            if os.path.normpath(allowed).lower() == source_normalized:
+                return True, ""
+        return False, f"Exécutable non autorisé : '{source}'. Non trouvé dans la whitelist."
+
+    # Pas de whitelist configurée — vérifier que le fichier existe
+    if not os.path.isfile(source):
+        return False, f"Fichier exécutable introuvable : '{source}'."
+
+    return True, ""
+
+
+# ══════════════════════════════════
+# WHITELIST VARIABLES D'ENVIRONNEMENT
+# ══════════════════════════════════
+
+# Variables toujours autorisées (inoffensives)
+_ALWAYS_ALLOWED_VARS = {"COMPUTERNAME", "USERNAME", "USERDOMAIN", "LOCALAPPDATA",
+                         "APPDATA", "TEMP", "TMP", "USERPROFILE"}
+
+
+def filter_env_var_resolution(var_name: str, allowed_vars: list[str]) -> bool:
+    """Vérifie si une variable d'environnement peut être résolue."""
+    if var_name in _ALWAYS_ALLOWED_VARS:
+        return True
+    if allowed_vars and var_name in allowed_vars:
+        return True
+    if not allowed_vars:
+        return True  # Mode dégradé, tout autorisé
+    logger.warning(f"Variable d'environnement ${{{var_name}}} non autorisée. Ignorée.")
+    return False
+
+
+# ══════════════════════════════════
+# VÉRIFICATION CHROMEDRIVER
+# ══════════════════════════════════
+
+def verify_chromedriver_hash(driver_path: str, expected_hash: Optional[str]) -> bool:
+    """Vérifie le hash SHA-256 de chromedriver.exe."""
+    if not expected_hash:
+        logger.info("Pas de hash ChromeDriver configuré. Vérification ignorée.")
+        return True
+
+    if not os.path.isfile(driver_path):
+        logger.error(f"ChromeDriver introuvable : {driver_path}")
+        return False
+
+    sha256 = hashlib.sha256()
+    with open(driver_path, 'rb') as f:
+        for block in iter(lambda: f.read(8192), b''):
+            sha256.update(block)
+
+    actual = sha256.hexdigest().lower()
+    expected = expected_hash.strip().lower()
+
+    if actual != expected:
+        logger.error(f"ChromeDriver hash mismatch ! "
+                     f"Attendu: {expected[:16]}..., Obtenu: {actual[:16]}...")
+        return False
+
+    logger.info("ChromeDriver : intégrité vérifiée (SHA-256 OK).")
+    return True
+
+
+# ══════════════════════════════════
+# VALIDATION COMPLÈTE D'UNE CONFIG
+# ══════════════════════════════════
+
+def validate_config(config: dict, global_config: dict) -> list[str]:
+    """
+    Vérifie uniquement les règles de sécurité (Whitelists, exécutables, commandes).
+    La validation structurelle et des types est gérée en amont par Pydantic.
+    """
+    errors = []
+    security = global_config.get("security", {})
+    allowed_domains = security.get("allowed_domains", [])
+    allowed_executables = security.get("allowed_executables", [])
+
+    for ecran in config.get("affichage_config", []) or []:
+        for app in ecran.get("applications", []):
+            nom = app.get("nom", "inconnu")
+            t = app.get("type", "web")
+            source = app.get("source", "")
+
+            # Valider les URLs web
+            if t == "web":
+                # Les diaporamas convertis sont des pages locales (file://) générées par
+                # le compilateur dans le cache de l'app : aucune navigation réseau, donc
+                # hors périmètre de la whitelist de domaines. La config étant signée (HMAC),
+                # une source file:// ne peut provenir que du compilateur, pas d'une saisie.
+                is_local_page = source.lower().startswith("file:")
+                if not is_local_page and not validate_url_domain(source, allowed_domains):
+                    errors.append(f"[{nom}] Domaine non autorisé : {source}")
+
+            # Valider les exécutables desktop
+            if t == "desktop_app":
+                is_valid, err = validate_executable(source, allowed_executables)
+                if not is_valid:
+                    errors.append(f"[{nom}] {err}")
+
+                # Valider les séquences send_keys (desktop seulement)
+                seq = app.get("sequence", [])
+                if seq:
+                    seq_errors = validate_sendkeys_sequence(seq)
+                    for se in seq_errors:
+                        errors.append(f"[{nom}] {se}")
+
+    return errors
+
+
+
+_restart_times: list[float] = []
+_restart_lock = threading.Lock()
+
+
+def check_restart_rate(max_restarts: int = 3, window_seconds: int = 300) -> bool:
+    """
+    Vérifie si le taux de redémarrage est acceptable.
+    Retourne True si le restart est autorisé, False si on est en protection.
+    """
+    now = time.time()
+    with _restart_lock:
+        # Nettoyer les entrées hors fenêtre
+        _restart_times[:] = [t for t in _restart_times if now - t < window_seconds]
+
+        if len(_restart_times) >= max_restarts:
+            logger.warning(f"Protection anti-rejeu : {len(_restart_times)} restarts en "
+                           f"{window_seconds}s. Commande ignorée (max {max_restarts}).")
+            return False
+
+        _restart_times.append(now)
+        return True
+
+

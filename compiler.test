@@ -1,0 +1,431 @@
+
+"""
+compiler.py — Pipeline de compilation des configurations kiosk.
+
+"""
+
+import os
+from typing import Optional
+
+from loguru import logger
+
+import config as cfg
+import skills
+from skills import SkillError, SkillNotFoundError
+
+
+class CompilationError(Exception):
+    """Erreur lors de la compilation d'une config (résolution ou fusion)."""
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ÉTAPE 1 — Résolution des SkillRef en Application
+# ══════════════════════════════════════════════════════════════════════
+
+def _skill_to_application(skill_data: dict, temps_affichage: int) -> dict:
+    """
+    Fusionne un skill + son contexte d'affichage pour produire une Application
+    au format attendu par l'engine.
+    """
+    app = {
+        "nom": skill_data.get("nom", ""),
+        "type": skill_data.get("type", "web"),
+        "source": skill_data.get("source", ""),
+        "url_entree": skill_data.get("url_entree"),
+        "temps_affichage": temps_affichage,
+        "refresh_auto": skill_data.get("refresh_auto", True),
+        "fenetre_classe": skill_data.get("fenetre_classe"),
+        "sequence": list(skill_data.get("sequence", [])),
+    }
+    return app
+
+
+# Permet de désactiver la conversion PPT→Web (tests, debug) sans toucher au code.
+_ENV_DISABLE_PPT_RENDER = "KIOSK_DISABLE_PPT_RENDER"
+
+
+def _maybe_render_ppt(app: dict, duree_diapo: Optional[int] = None,
+                      boucles: int = 1) -> dict:
+    """Transforme une Application 'ppt' en page web locale (diapos en images).
+
+    PowerPoint ne joue qu'un seul diaporama à la fois : pour autoriser l'affichage
+    simultané d'un même .pptx (ou de .pptx différents) sur plusieurs écrans, on
+    exporte les diapos en images et on les diffuse comme une page web via le chemin
+    Chrome par moniteur (qui gère déjà le multi-écran). Voir ppt_render.py.
+
+    Le temps d'affichage est CALCULÉ : durée d'un cycle (durée/diapo × nb diapos, ou
+    minutages du fichier) × nombre de boucles. 'duree_diapo' est prioritaire si fournie.
+
+    Lève CompilationError si la conversion échoue : l'engine ne sait pas afficher un
+    'ppt' brut, donc un message clair au démarrage vaut mieux qu'une erreur runtime.
+    """
+    if app.get("type") != "ppt":
+        return app
+
+    # Bypass debug/test : laisse l'app 'ppt' telle quelle (non convertie).
+    if os.getenv(_ENV_DISABLE_PPT_RENDER):
+        return app
+
+    try:
+        import ppt_render
+    except Exception as e:
+        raise CompilationError(
+            f"Diaporama '{app.get('nom')}' : module 'ppt_render' introuvable ({e}). "
+            f"Vérifie qu'il est déployé à la racine du projet."
+        ) from e
+
+    result = ppt_render.render_ppt_to_web(
+        app.get("source", ""),
+        duree_diapo=duree_diapo,
+        boucles=boucles,
+    )
+    if not result:
+        raise CompilationError(
+            f"Diaporama '{app.get('nom')}' : conversion impossible. "
+            f"PowerPoint est-il installé ? Le fichier est-il accessible et valide ? "
+            f"(source = '{app.get('source')}')"
+        )
+
+    web_app = dict(app)
+    web_app["type"] = "web"
+    web_app["source"] = "file:///" + result["html"].replace("\\", "/")
+    web_app["temps_affichage"] = result["duree_totale_s"]
+    web_app["url_entree"] = None
+    web_app["refresh_auto"] = False  # le carrousel JS tourne en continu (pas de reload)
+    web_app["fenetre_classe"] = None
+    web_app["sequence"] = []
+    return web_app
+
+
+# def resolve_skill_refs(base_dir: str, raw_config: dict,
+#                         site: Optional[str] = None,
+#                         workspace: Optional[str] = None) -> dict:
+#     """
+#     Résout toutes les SkillRef d'une config en Applications complètes.
+#     Ne modifie PAS raw_config, retourne une copie.
+#
+#     Lève CompilationError si une ref est introuvable ou malformée.
+#     """
+#     out = dict(raw_config)
+#
+#
+#     if raw_config.get("type") == "playlist":
+#         return out
+#
+#     ecrans_raw = raw_config.get("affichage_config") or []
+#     ecrans_out = []
+#     missing_refs = []
+#
+#     for idx, ecran in enumerate(ecrans_raw):
+#         monitor_index = ecran.get("monitor_index", 1)
+#         apps_raw = ecran.get("applications", []) or []
+#         apps_out = []
+#
+#         for app_idx, ref in enumerate(apps_raw):
+#             if not isinstance(ref, dict) or "skill" not in ref:
+#                 missing_refs.append(
+#                     f"écran {monitor_index} / app #{app_idx + 1}: "
+#                     f"référence skill manquante"
+#                 )
+#                 continue
+#
+#             ref_str = ref["skill"]
+#             temps = ref.get("temps_affichage", 30)
+#
+#             try:
+#                 skill_data = skills.load_skill(base_dir, ref_str, site, workspace)
+#             except SkillNotFoundError as e:
+#                 missing_refs.append(
+#                     f"écran {monitor_index} / app #{app_idx + 1} : {e}"
+#                 )
+#                 continue
+#             except SkillError as e:
+#                 missing_refs.append(
+#                     f"écran {monitor_index} / app #{app_idx + 1} (ref '{ref_str}'): {e}"
+#                 )
+#                 continue
+#
+#             apps_out.append(_skill_to_application(skill_data, temps))
+#
+#         if apps_out:
+#             ecrans_out.append({
+#                 "monitor_index": monitor_index,
+#                 "applications": apps_out,
+#             })
+#
+#     if missing_refs:
+#         detail = "\n  - ".join(missing_refs)
+#         raise CompilationError(
+#             f"Impossible de résoudre {len(missing_refs)} référence(s) skill :\n  - {detail}"
+#         )
+#
+#     if not ecrans_out:
+#         raise CompilationError(
+#             "La configuration ne contient aucun écran/application valide après résolution."
+#         )
+#
+#     out["affichage_config"] = ecrans_out
+#     return out
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ÉTAPE 2 — Fusion de playlist
+# ══════════════════════════════════════════════════════════════════════
+
+def _strip_login_for_repetition(app: dict) -> dict:
+    """
+    Sur les passages > 1 d'une playlist, on retire le login pour éviter
+    la répétition inutile (et potentiellement bloquante).
+    """
+    copy = dict(app)
+    if copy.get("url_entree"):
+        copy["url_entree"] = None
+        copy["sequence"] = []
+    else:
+        copy["sequence"] = [
+            act for act in copy.get("sequence", [])
+            if act.get("action") != "smart_login"
+        ]
+    return copy
+
+
+def _find_config_path(target_name: str, available_configs: dict[str, str]) -> Optional[str]:
+    """
+    Cherche le chemin d'une config par nom de fichier ou display_name.
+    `available_configs` est le dict retourné par list_configs_hierarchical.
+    """
+    import os
+    for display_name, path in available_configs.items():
+        if os.path.basename(path) == target_name or display_name == target_name:
+            return path
+    return None
+
+
+# def _merge_playlist(base_dir: str, raw_config: dict, global_config: dict,
+#                     site: Optional[str], workspace: Optional[str]) -> dict:
+#     """
+#     Fusionne une playlist en une config kiosk unique.
+#     Les sous-configs sont compilées récursivement (résolution skills incluse).
+#     """
+#     items = raw_config.get("items") or []
+#     if not items:
+#         raise CompilationError("La playlist est vide.")
+#
+#     logger.info("🔄 PLAYLIST : Fusion des configurations en mémoire (Mode Transparent)...")
+#
+#     available_configs = cfg.list_carousels_hierarchical(base_dir, site, workspace)
+#
+#     merged_monitors: dict[int, list] = {}
+#     merged_global_params = dict(raw_config.get("parametres_globaux", {}))
+#
+#     erreurs_details = []
+#
+#     for item in items:
+#         target_name = item.get("config", "")
+#         passages = int(item.get("passages", item.get("duration_min", 1)) or 1)
+#
+#         sub_path = _find_config_path(target_name, available_configs)
+#         if not sub_path:
+#             logger.warning(f"⚠️ Config '{target_name}' introuvable. Ignorée.")
+#             erreurs_details.append(f"❌ '{target_name}' : Fichier introuvable dans la hiérarchie.")
+#             continue
+#
+#         try:
+#             sub_raw = cfg.charger_config(sub_path, global_config)
+#             sub_compiled = compile_config(
+#                 base_dir, sub_raw, global_config,
+#                 site=site, workspace=workspace,
+#                 _allow_nested_playlist=False,
+#             )
+#
+#             for k, v in sub_compiled.get("parametres_globaux", {}).items():
+#                 if k not in merged_global_params:
+#                     merged_global_params[k] = v
+#
+#             apps_found = False
+#             for ecran in sub_compiled.get("affichage_config") or []:
+#                 m_idx = ecran["monitor_index"]
+#                 apps = ecran.get("applications", [])
+#                 if not apps:
+#                     continue
+#
+#                 apps_found = True
+#                 logger.info(
+#                     f"  -> Ajout de '{target_name}' : séquence compilée "
+#                     f"pour {passages} passage(s)."
+#                 )
+#
+#                 for p in range(passages):
+#                     for original_app in apps:
+#                         app_copy = (
+#                             dict(original_app) if p == 0
+#                             else _strip_login_for_repetition(original_app)
+#                         )
+#                         merged_monitors.setdefault(m_idx, []).append(app_copy)
+#
+#             if not apps_found:
+#                 erreurs_details.append(
+#                     f"⚠️ '{target_name}' : Le fichier existe mais ne contient aucune application valide.")
+#
+#         except Exception as e:
+#             logger.error(f"❌ Impossible de fusionner '{target_name}' : {e}")
+#             erreurs_details.append(f"❌ '{target_name}' : {e}")
+#
+#     affichage_final = [
+#         {"monitor_index": m_idx, "applications": apps}
+#         for m_idx, apps in merged_monitors.items() if apps
+#     ]
+#
+#     if not affichage_final:
+#         raisons = "\n".join(
+#             erreurs_details) if erreurs_details else "Toutes les configurations étaient mystérieusement vides."
+#         raise CompilationError(f"La playlist n'a généré aucune application valide.\n\nDétail des échecs :\n{raisons}")
+#
+#     result = {
+#         "type": "kiosk",
+#         "parametres_globaux": merged_global_params,
+#         "affichage_config": affichage_final,
+#     }
+#
+#     total_apps = sum(len(e['applications']) for e in affichage_final)
+#     logger.info(
+#         f"✅ Playlist compilée : {total_apps} affichages ajoutés à la boucle principale."
+#     )
+#     return result
+
+
+# ══════════════════════════════════════════════════════════════════════
+# POINT D'ENTRÉE PUBLIC
+# ══════════════════════════════════════════════════════════════════════
+
+# def compile_config(base_dir: str, raw_config: dict, global_config: dict,
+#                     site: Optional[str] = None, workspace: Optional[str] = None,
+#                     _allow_nested_playlist: bool = True) -> dict:
+#     """
+#     Compile une config brute en config prête pour l'engine.
+#
+#     Étapes :
+#       1. Résout les SkillRef en Applications (mode kiosk).
+#       2. Fusionne la playlist si type == 'playlist'.
+#
+#     Paramètres :
+#       - raw_config : dict brut (issu de cfg.charger_config)
+#       - global_config : dict global (pour résolution ENV vars)
+#       - site, workspace : contexte pour la résolution des skills
+#       - _allow_nested_playlist : flag interne anti-récursion infinie
+#
+#     Retourne un dict au format KioskConfig (type="kiosk", affichage_config=[...]).
+#     Lève CompilationError en cas d'échec.
+#     """
+#     config_type = raw_config.get("type", "kiosk")
+#
+#     if config_type == "playlist":
+#         if not _allow_nested_playlist:
+#             raise CompilationError(
+#                 "Playlist imbriquée interdite (une playlist ne peut pas en référencer une autre)."
+#             )
+#         return _merge_playlist(base_dir, raw_config, global_config, site, workspace)
+#
+#     return resolve_skill_refs(base_dir, raw_config, site, workspace)
+
+
+def resolve_skill_refs(base_dir: str, raw_config: dict,
+                       site: Optional[str] = None,
+                       workspace: Optional[str] = None,
+                       default_monitor: int = 1) -> dict:
+    out = dict(raw_config)
+    if raw_config.get("type") == "playlist":
+        return out
+
+    apps_raw = raw_config.get("applications", []) or []
+    apps_out = []
+    missing_refs = []
+
+    for app_idx, ref in enumerate(apps_raw):
+        if not isinstance(ref, dict) or "skill" not in ref:
+            missing_refs.append(f"app #{app_idx + 1}: référence skill manquante")
+            continue
+
+        ref_str = ref["skill"]
+        temps = ref.get("temps_affichage", 30)
+        duree_diapo = ref.get("duree_diapo")
+        boucles = ref.get("boucles", 1)
+
+        try:
+            skill_data = skills.load_skill(base_dir, ref_str, site, workspace)
+            app = _skill_to_application(skill_data, temps)
+            apps_out.append(_maybe_render_ppt(app, duree_diapo=duree_diapo, boucles=boucles))
+        except Exception as e:
+            missing_refs.append(f"app #{app_idx + 1} : {e}")
+            continue
+
+    if missing_refs:
+        detail = "\n  - ".join(missing_refs)
+        raise CompilationError(f"Impossible de résoudre {len(missing_refs)} référence(s) :\n  - {detail}")
+
+    if not apps_out:
+        raise CompilationError("La configuration ne contient aucune application valide.")
+
+    # On recrée la structure 'affichage_config' requise par engine.py
+    out["affichage_config"] = [{"monitor_index": default_monitor, "applications": apps_out}]
+    out.pop("applications", None)
+    return out
+
+
+def _merge_playlist(base_dir: str, raw_config: dict, global_config: dict,
+                    site: Optional[str], workspace: Optional[str]) -> dict:
+    items = raw_config.get("items") or []
+    if not items: raise CompilationError("La playlist est vide.")
+
+    logger.info("🔄 PLAYLIST : Fusion des configurations en mémoire...")
+    available_configs = cfg.list_carousels_hierarchical(base_dir, site, workspace)
+    merged_monitors: dict[int, list] = {}
+    merged_global_params = dict(raw_config.get("parametres_globaux", {}))
+    erreurs_details = []
+
+    for item in items:
+        target_name = item.get("config", "")
+        passages = int(item.get("passages", 1) or 1)
+        monitor_idx = int(item.get("monitor_index", 1))
+
+        sub_path = _find_config_path(target_name, available_configs)
+        if not sub_path:
+            erreurs_details.append(f"❌ '{target_name}' : Fichier introuvable.")
+            continue
+
+        try:
+            sub_raw = cfg.charger_config(sub_path, global_config)
+            # On passe le monitor_idx au compilateur pour qu'il l'injecte
+            sub_compiled = compile_config(base_dir, sub_raw, global_config, site, workspace, False, monitor_idx)
+
+            for k, v in sub_compiled.get("parametres_globaux", {}).items():
+                if k not in merged_global_params: merged_global_params[k] = v
+
+            for ecran in sub_compiled.get("affichage_config") or []:
+                m_idx = ecran["monitor_index"]
+                apps = ecran.get("applications", [])
+                for p in range(passages):
+                    for original_app in apps:
+                        app_copy = dict(original_app) if p == 0 else _strip_login_for_repetition(original_app)
+                        merged_monitors.setdefault(m_idx, []).append(app_copy)
+
+        except Exception as e:
+            erreurs_details.append(f"❌ '{target_name}' : {e}")
+
+    affichage_final = [{"monitor_index": m, "applications": a} for m, a in merged_monitors.items() if a]
+    if not affichage_final:
+        raise CompilationError("La playlist n'a généré aucune application.\n" + "\n".join(erreurs_details))
+
+    return {"type": "kiosk", "parametres_globaux": merged_global_params, "affichage_config": affichage_final}
+
+
+def compile_config(base_dir: str, raw_config: dict, global_config: dict,
+                   site: Optional[str] = None, workspace: Optional[str] = None,
+                   _allow_nested_playlist: bool = True, default_monitor: int = 1) -> dict:
+    config_type = raw_config.get("type", "kiosk")
+    if config_type == "playlist":
+        if not _allow_nested_playlist:
+            raise CompilationError("Playlist imbriquée interdite.")
+        return _merge_playlist(base_dir, raw_config, global_config, site, workspace)
+    return resolve_skill_refs(base_dir, raw_config, site, workspace, default_monitor)
+
