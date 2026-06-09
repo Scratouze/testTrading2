@@ -51,7 +51,7 @@ _DONE_MARKER = ".render_done"       # marqueur de cache complet (anti-cache part
 _META_FILENAME = "meta.json"
 _HTML_FILENAME = "show.html"
 _CACHE_KEY_LEN = 16
-_RENDER_VERSION = 2                 # bumper à chaque changement de rendu → invalide les caches
+_RENDER_VERSION = 3                 # bumper à chaque changement de rendu → invalide les caches
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -156,68 +156,95 @@ def _convert(pptx_path: str, duree_diapo: Optional[int], boucles: int,
 
 
 def _export_slides_com(pptx_path: str, out_dir: str) -> list[dict]:
-    """Exporte chaque diapo en image et lit son minutage d'avancement automatique.
+    """Convertit le .pptx en PNG via PDF (moteur PDF de PowerPoint + PyMuPDF).
 
-    L'import de pywin32 (pythoncom / win32com.client) est fait *à l'intérieur* de
-    la fonction afin que le module reste importable hors Windows (tests, CI).
+    Pourquoi pas Slide.Export ? Le moteur d'IMAGES de PowerPoint est neutralisé sur les
+    postes Office verrouillés (export silencieusement sans effet). Le moteur PDF
+    (ExportAsFixedFormat, = « Enregistrer au format PDF ») reste, lui, fiable et
+    indépendant du rendu écran. On exporte donc le deck en PDF, puis PyMuPDF (paquet
+    Python, pas d'exe → hors AppLocker) rend chaque page en PNG.
 
-    Returns:
-        Liste ordonnée [{"file": "slide_001.png", "ms": <int>}, ...]. "ms" vaut 0
-        quand la diapo n'a pas de minutage automatique dans le .pptx.
+    L'import de pywin32 (pythoncom / win32com.client) est fait *à l'intérieur* de la
+    fonction afin que le module reste importable hors Windows (tests, CI).
     """
     import pythoncom
     import win32com.client
 
+    pdf_path = os.path.join(out_dir, "_deck.pdf")
     pythoncom.CoInitialize()
     powerpoint = None
     presentation = None
     previous_security = None
     try:
         powerpoint = win32com.client.Dispatch("PowerPoint.Application")
-        # Mode automatisation : désactive macros + alertes de sécurité (aucun dialogue
-        # ne doit figer le kiosque sans surveillance). Restauré dans le finally.
+        # Mode automatisation : désactive macros + alertes (aucun dialogue ne doit figer
+        # le kiosque sans surveillance). Restauré dans le finally.
         try:
             previous_security = powerpoint.AutomationSecurity
             powerpoint.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
         except Exception:
             previous_security = None
-        # WithWindow=True : PowerPoint doit pouvoir *rendre* les diapos, sinon Slide.Export
-        # reste silencieusement sans effet. NB : déplacer la fenêtre hors écran casse le
-        # rendu sur certains postes (GPU/RDP : fenêtre non composée → export vide). On la
-        # laisse donc visible le temps de la conversion, qui a lieu une seule fois au
-        # démarrage (à la compilation de la config), puis est mise en cache.
+        # L'export PDF ne dépend pas d'une fenêtre de rendu → WithWindow=False (rien à
+        # l'écran). 2 = ppFixedFormatTypePDF.
         presentation = powerpoint.Presentations.Open(
-            os.path.abspath(pptx_path), ReadOnly=True, Untitled=False, WithWindow=True
+            os.path.abspath(pptx_path), ReadOnly=True, Untitled=False, WithWindow=False
         )
-
-        export_w, export_h = _compute_export_size(presentation)
-        slides_meta: list[dict] = []
-
-        for index in range(1, presentation.Slides.Count + 1):
-            slide = presentation.Slides(index)
-            file_name = f"slide_{index:03d}.{_IMG_EXT}"
-            target = os.path.join(out_dir, file_name)
-            slide.Export(target, _IMG_FILTER, export_w, export_h)
-            # Repli : certains postes refusent l'export avec dimensions explicites.
-            if not os.path.isfile(target):
-                slide.Export(target, _IMG_FILTER)
-            # Vérification : un export silencieusement sans effet est ainsi détecté tôt.
-            if not os.path.isfile(target):
-                raise RuntimeError(
-                    f"Export PowerPoint sans effet : aucun fichier écrit pour la diapo "
-                    f"{index} (filtres graphiques indisponibles ? rendu écran impossible ?)."
-                )
-            slides_meta.append({"file": file_name, "ms": _read_advance_ms(slide)})
-
-        return slides_meta
+        presentation.ExportAsFixedFormat(pdf_path, 2)
     finally:
         if powerpoint is not None and previous_security is not None:
             try:
-                powerpoint.AutomationSecurity = previous_security  # bonne hygiène (cf. doc MS)
+                powerpoint.AutomationSecurity = previous_security
             except Exception:
                 pass
         _safe_close(presentation, powerpoint)
         pythoncom.CoUninitialize()
+
+    if not os.path.isfile(pdf_path) or os.path.getsize(pdf_path) == 0:
+        raise RuntimeError(
+            "Export PDF PowerPoint sans effet (ExportAsFixedFormat n'a rien produit). "
+            "Le fichier est-il valide et accessible ?"
+        )
+    return _pdf_to_pngs(pdf_path, out_dir, cleanup_pdf=True)
+
+
+def _pdf_to_pngs(pdf_path: str, out_dir: str, cleanup_pdf: bool = False) -> list[dict]:
+    """Rend chaque page d'un PDF en PNG (slide_001.png, …) via PyMuPDF.
+
+    Le bord long est calé sur _EXPORT_LONG_EDGE_PX (aspect préservé). 'ms' vaut 0 : le
+    minutage par diapo est appliqué ensuite (durée/diapo prioritaire).
+    """
+    try:
+        import fitz  # PyMuPDF
+    except Exception as e:
+        raise RuntimeError(
+            "PyMuPDF est requis pour la conversion PPT→PDF→images. Installer le paquet "
+            "'pymupdf' (pip install pymupdf) depuis le dépôt interne."
+        ) from e
+
+    slides_meta: list[dict] = []
+    doc = None
+    try:
+        doc = fitz.open(pdf_path)
+        for index in range(doc.page_count):
+            page = doc.load_page(index)
+            long_edge = max(page.rect.width, page.rect.height) or 1.0
+            zoom = _EXPORT_LONG_EDGE_PX / long_edge
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+            file_name = f"slide_{index + 1:03d}.{_IMG_EXT}"
+            pixmap.save(os.path.join(out_dir, file_name))
+            slides_meta.append({"file": file_name, "ms": 0})
+    finally:
+        if doc is not None:
+            doc.close()
+        if cleanup_pdf:
+            try:
+                os.remove(pdf_path)
+            except OSError:
+                pass
+
+    if not slides_meta:
+        raise RuntimeError("Le PDF exporté ne contient aucune page.")
+    return slides_meta
 
 
 def _compute_export_size(presentation) -> tuple[int, int]:
