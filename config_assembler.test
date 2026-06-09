@@ -33,7 +33,7 @@ import json
 import shutil
 import hashlib
 import base64
-from typing import Optional
+from typing import Optional, Callable
 
 from loguru import logger
 
@@ -52,6 +52,32 @@ _META_FILENAME = "meta.json"
 _HTML_FILENAME = "show.html"
 _CACHE_KEY_LEN = 16
 _RENDER_VERSION = 3                 # bumper à chaque changement de rendu → invalide les caches
+
+
+# ── Hook de progression (optionnel) ───────────────────────────────────
+# Permet à l'appelant (ex. le splash de démarrage) d'afficher l'avancement de la
+# conversion. Reste None par défaut : aucun impact si personne ne le branche.
+_PROGRESS_CB: Optional[Callable[[str, Optional[float]], None]] = None
+
+
+def set_progress_callback(callback: Optional[Callable[[str, Optional[float]], None]]) -> None:
+    """Branche (ou débranche avec None) un callback de progression de conversion.
+
+    Le callback reçoit (message: str, fraction: Optional[float]). 'fraction' vaut
+    la progression intra-présentation (0.0→1.0) quand elle est connue, sinon None.
+    """
+    global _PROGRESS_CB
+    _PROGRESS_CB = callback
+
+
+def _report(message: str, fraction: Optional[float] = None) -> None:
+    """Notifie la progression si un callback est branché. Ne casse jamais la conversion."""
+    if _PROGRESS_CB is None:
+        return
+    try:
+        _PROGRESS_CB(message, fraction)
+    except Exception as e:  # le reporting ne doit jamais faire échouer le rendu
+        logger.debug(f"[PPT→Web] Callback de progression ignoré : {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -125,6 +151,7 @@ def _convert(pptx_path: str, duree_diapo: Optional[int], boucles: int,
         os.makedirs(out_dir, exist_ok=True)
 
         logger.info(f"[PPT→Web] Conversion de '{os.path.basename(pptx_path)}'...")
+        _report(f"Conversion de « {os.path.basename(pptx_path)} »...", None)
         staged = _stage_in_trusted_dir(pptx_path)  # copie locale approuvée (contourne le File Block)
         slides_meta = _export_slides_com(staged or pptx_path, out_dir)
         if not slides_meta:
@@ -180,6 +207,7 @@ def _export_slides_com(pptx_path: str, out_dir: str) -> list[dict]:
         # arguments optionnels (sentinelles) cassent SaveAs/ExportAsFixedFormat avec
         # « Python instance can not be converted to a COM object ».
         logger.debug("[PPT→Web] COM : démarrage de PowerPoint (liaison tardive)...")
+        _report("Ouverture de PowerPoint...", None)
         powerpoint = win32com.client.dynamic.Dispatch("PowerPoint.Application")
         try:
             previous_security = powerpoint.AutomationSecurity
@@ -196,6 +224,7 @@ def _export_slides_com(pptx_path: str, out_dir: str) -> list[dict]:
             os.path.abspath(pptx_path), ReadOnly=True, Untitled=False, WithWindow=False
         )
         logger.debug(f"[PPT→Web] COM : {presentation.Slides.Count} diapo(s) — export PDF (SaveAs)...")
+        _report("Export PDF en cours...", None)
         # SaveAs au format PDF (ppSaveAsPDF = 32), simple à marshaler en liaison tardive.
         presentation.SaveAs(pdf_path, 32)
         logger.debug("[PPT→Web] COM : PDF généré.")
@@ -234,6 +263,7 @@ def _pdf_to_pngs(pdf_path: str, out_dir: str, cleanup_pdf: bool = False) -> list
     doc = None
     try:
         doc = fitz.open(pdf_path)
+        total_pages = doc.page_count or 1
         for index in range(doc.page_count):
             page = doc.load_page(index)
             long_edge = max(page.rect.width, page.rect.height) or 1.0
@@ -242,6 +272,8 @@ def _pdf_to_pngs(pdf_path: str, out_dir: str, cleanup_pdf: bool = False) -> list
             file_name = f"slide_{index + 1:03d}.{_IMG_EXT}"
             pixmap.save(os.path.join(out_dir, file_name))
             slides_meta.append({"file": file_name, "ms": 0})
+            _report(f"Rendu des diapos... {index + 1}/{total_pages}",
+                    (index + 1) / total_pages)
     finally:
         if doc is not None:
             doc.close()
