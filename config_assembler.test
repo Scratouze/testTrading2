@@ -45,7 +45,6 @@ _CROSSFADE_MS = 600                 # durée du fondu enchaîné entre 2 diapos
 _MIN_SLIDE_MS = 1000                # plancher de durée par diapo (anti-clignotement)
 _DEFAULT_SLIDE_S = 8                # durée/diapo par défaut (ni durée fixée, ni minutage)
 _CACHE_DIR_NAME = "PptCache"        # sous %LOCALAPPDATA%/KioskEngine/
-_WORK_DIR_NAME = "PptWork"          # dossier LOCAL approuvé où copier les .pptx avant ouverture
 _OFFICE_VERSIONS = ("16.0", "15.0", "14.0")  # versions Office candidates (LTSC = 16.0)
 _DONE_MARKER = ".render_done"       # marqueur de cache complet (anti-cache partiel)
 _META_FILENAME = "meta.json"
@@ -279,13 +278,11 @@ def _build_show_html(slides_meta: list[dict]) -> str:
             .replace("__SLIDES_JSON__", payload))
 
 
-# ── Emplacement approuvé / mise en scène (postes verrouillés par GPO) ──
-
-def _resolve_work_dir() -> str:
-    """Dossier de travail LOCAL (sous %LOCALAPPDATA%) où les .pptx sont copiés."""
-    base = os.getenv("LOCALAPPDATA") or os.path.expanduser("~")
-    return os.path.join(base, "KioskEngine", _WORK_DIR_NAME)
-
+# ── Emplacement approuvé existant (postes verrouillés par GPO) ──
+# Idée : ne PAS tenter d'AJOUTER un emplacement approuvé (l'UI/GPO le refuse), mais
+# RÉUTILISER ceux qu'Office approuve par défaut (ex. %APPDATA%\Microsoft\Templates),
+# qui restent actifs même Trust Center verrouillé. On y dépose une copie temporaire du
+# deck, exemptée de File Block, puis on la supprime juste après l'export.
 
 def _office_version() -> str:
     """Version Office présente (clé PowerPoint dans HKCU), '16.0' par défaut (LTSC)."""
@@ -300,80 +297,123 @@ def _office_version() -> str:
     return "16.0"
 
 
-def _trusted_locations_globally_disabled(ver: str) -> bool:
-    """True si TOUS les emplacements approuvés sont désactivés (stratégie/registre).
+def _enumerate_trusted_locations(ver: str) -> list:
+    """Emplacements approuvés PowerPoint (chemins existants, locaux), %VARS% développées.
 
-    Dans ce cas, enregistrer un emplacement approuvé ne sert à rien : c'est le signal
-    qu'il faut une intervention IT (emplacement approuvé GPO) ou un autre moteur.
+    Lit les ruches non-stratégie ET stratégie : les emplacements par défaut d'Office y
+    figurent (ex. dossier Templates utilisateur). Renvoie [(chemin, allow_subfolders)].
     """
     import winreg
-    candidates = [
+    roots = [
+        (winreg.HKEY_CURRENT_USER,
+         rf"Software\Microsoft\Office\{ver}\PowerPoint\Security\Trusted Locations"),
         (winreg.HKEY_CURRENT_USER,
          rf"Software\Policies\Microsoft\Office\{ver}\PowerPoint\Security\Trusted Locations"),
         (winreg.HKEY_LOCAL_MACHINE,
          rf"Software\Policies\Microsoft\Office\{ver}\PowerPoint\Security\Trusted Locations"),
-        (winreg.HKEY_CURRENT_USER,
-         rf"Software\Microsoft\Office\{ver}\PowerPoint\Security\Trusted Locations"),
     ]
-    for hive, path in candidates:
+    unc_prefix = chr(92) * 2  # antislash x2 = préfixe d'un chemin réseau (à exclure)
+    found = []
+    for hive, base in roots:
         try:
-            with winreg.OpenKey(hive, path) as key:
-                value, _ = winreg.QueryValueEx(key, "AllLocationsDisabled")
-                if int(value) == 1:
-                    return True
+            bkey = winreg.OpenKey(hive, base)
         except OSError:
             continue
-    return False
+        try:
+            index = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(bkey, index)
+                    index += 1
+                except OSError:
+                    break
+                try:
+                    with winreg.OpenKey(bkey, sub) as skey:
+                        raw, _ = winreg.QueryValueEx(skey, "Path")
+                        path = os.path.expandvars(str(raw)).rstrip(chr(92))
+                        try:
+                            allow_sub, _ = winreg.QueryValueEx(skey, "AllowSubFolders")
+                        except OSError:
+                            allow_sub = 0
+                        if path and not path.startswith(unc_prefix) and os.path.isdir(path):
+                            found.append((path, bool(allow_sub)))
+                except OSError:
+                    continue
+        finally:
+            winreg.CloseKey(bkey)
+    return found
 
 
-def _ensure_trusted_location(folder: str) -> bool:
-    """Enregistre `folder` comme emplacement approuvé PowerPoint (HKCU, hors stratégie).
-
-    Idempotent. Hors-stratégie → non écrasé par les rafraîchissements GPO. Renvoie
-    False si les emplacements approuvés sont globalement désactivés par stratégie.
-    """
-    import winreg
-    ver = _office_version()
-    if _trusted_locations_globally_disabled(ver):
-        return False
-
-    sub = rf"Software\Microsoft\Office\{ver}\PowerPoint\Security\Trusted Locations\KioskEngineWork"
+def _dir_is_writable(folder: str) -> bool:
+    """Teste l'écriture réelle dans `folder` (plus fiable que os.access sous Windows)."""
+    probe = os.path.join(folder, f".ke_probe_{os.getpid()}")
     try:
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, sub) as key:
-            path_value = folder if folder.endswith("\\") else folder + "\\"
-            winreg.SetValueEx(key, "Path", 0, winreg.REG_SZ, path_value)
-            winreg.SetValueEx(key, "AllowSubFolders", 0, winreg.REG_DWORD, 1)
-            winreg.SetValueEx(key, "Description", 0, winreg.REG_SZ,
-                              "KioskEngine - dossier de travail PPT")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        os.remove(probe)
         return True
-    except OSError as e:
-        logger.warning(f"[PPT→Web] Enregistrement de l'emplacement approuvé impossible : {e}")
+    except OSError:
         return False
+
+
+def _pick_staging_dir() -> Optional[str]:
+    """Choisit un emplacement approuvé EXISTANT, local et inscriptible.
+
+    Priorité aux dossiers sous le profil utilisateur (Templates/Addins…), approuvés par
+    défaut et inscriptibles sans droits particuliers. Repli direct sur le dossier
+    Templates utilisateur si l'énumération ne donne rien.
+    """
+    try:
+        candidates = _enumerate_trusted_locations(_office_version())
+    except Exception:
+        candidates = []
+
+    appdata = (os.getenv("APPDATA") or "").rstrip(chr(92)).lower()
+
+    def under_profile(item):
+        return 0 if appdata and item[0].lower().startswith(appdata) else 1
+
+    for path, _allow in sorted(candidates, key=under_profile):
+        if _dir_is_writable(path):
+            return path
+
+    fallback = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"),
+                            "Microsoft", "Templates")
+    if os.path.isdir(fallback) and _dir_is_writable(fallback):
+        return fallback
+    return None
 
 
 def _stage_in_trusted_dir(pptx_path: str) -> Optional[str]:
-    """Copie le .pptx dans un dossier LOCAL approuvé puis renvoie le chemin local.
+    """Copie le .pptx dans un emplacement approuvé existant ; renvoie le chemin local.
 
-    Sur poste verrouillé (GPO), le « Blocage des fichiers » du Trust Center empêche
-    PowerPoint d'ouvrir le .pptx en automatisation. Un fichier situé dans un
-    emplacement approuvé échappe au File Block ET à la Vue protégée. On enregistre
-    donc (une fois) un dossier local en emplacement approuvé HKCU et on y copie le
-    deck avant ouverture. Renvoie None en cas d'échec (repli sur le fichier d'origine).
+    Un fichier situé dans un emplacement approuvé échappe au File Block ET à la Vue
+    protégée — y compris Trust Center verrouillé par GPO, car les emplacements
+    approuvés PAR DÉFAUT restent actifs. La copie est supprimée juste après l'export
+    (cf. finally de _convert). Renvoie None si rien d'inscriptible n'est trouvé (repli
+    sur le fichier d'origine côté appelant).
     """
     try:
-        work_dir = _resolve_work_dir()
-        os.makedirs(work_dir, exist_ok=True)
-        if not _ensure_trusted_location(work_dir):
+        staging_dir = _pick_staging_dir()
+        if not staging_dir:
             logger.warning(
-                "[PPT→Web] Emplacements approuvés désactivés par stratégie (GPO) : "
-                "l'ouverture risque d'échouer. Demander à l'IT un emplacement approuvé "
-                "GPO pour le dossier de contenu, ou une exception de blocage de fichiers."
+                "[PPT→Web] Aucun emplacement approuvé inscriptible trouvé. Si l'ouverture "
+                "échoue, le File Block est sans échappatoire local (→ IT / conversion hors-poste)."
             )
-        local = os.path.join(work_dir, f"staged_{os.getpid()}.pptx")
+            return None
+        # Balaye d'éventuelles copies orphelines (si une suppression a échoué avant).
+        for name in os.listdir(staging_dir):
+            if name.startswith("~ke_staged_") and name.endswith(".pptx"):
+                try:
+                    os.remove(os.path.join(staging_dir, name))
+                except OSError:
+                    pass
+        local = os.path.join(staging_dir, f"~ke_staged_{os.getpid()}.pptx")
         shutil.copyfile(pptx_path, local)
+        logger.debug(f"[PPT→Web] Deck copié dans l'emplacement approuvé : {staging_dir}")
         return local
     except Exception as e:
-        logger.error(f"[PPT→Web] Mise en scène en zone approuvée impossible : {e}")
+        logger.error(f"[PPT→Web] Copie en emplacement approuvé impossible : {e}")
         return None
 
 
