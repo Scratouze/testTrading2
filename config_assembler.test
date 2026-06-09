@@ -181,9 +181,17 @@ def _export_slides_com(pptx_path: str, out_dir: str) -> list[dict]:
             powerpoint.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
         except Exception:
             previous_security = None
+        # WithWindow=True : PowerPoint doit pouvoir *rendre* les diapos, sinon l'export
+        # est silencieusement sans effet (aucun PNG écrit). On repousse la fenêtre hors
+        # écran pour qu'elle n'apparaisse pas sur le kiosque pendant la conversion.
         presentation = powerpoint.Presentations.Open(
-            os.path.abspath(pptx_path), ReadOnly=True, Untitled=False, WithWindow=False
+            os.path.abspath(pptx_path), ReadOnly=True, Untitled=False, WithWindow=True
         )
+        try:
+            powerpoint.WindowState = 1                  # ppWindowNormal (minimisé = pas de rendu)
+            powerpoint.Left, powerpoint.Top = 32000, 32000
+        except Exception:
+            pass  # le positionnement hors-écran est un confort, pas une nécessité
 
         export_w, export_h = _compute_export_size(presentation)
         slides_meta: list[dict] = []
@@ -191,8 +199,14 @@ def _export_slides_com(pptx_path: str, out_dir: str) -> list[dict]:
         for index in range(1, presentation.Slides.Count + 1):
             slide = presentation.Slides(index)
             file_name = f"slide_{index:03d}.{_IMG_EXT}"
-            slide.Export(os.path.join(out_dir, file_name),
-                         _IMG_FILTER, export_w, export_h)
+            target = os.path.join(out_dir, file_name)
+            slide.Export(target, _IMG_FILTER, export_w, export_h)
+            # Vérification : un export silencieusement sans effet est ainsi détecté tôt.
+            if not os.path.isfile(target):
+                raise RuntimeError(
+                    f"Export PowerPoint sans effet : aucun fichier écrit pour la diapo "
+                    f"{index} (vérifier le mode d'ouverture / les filtres graphiques)."
+                )
             slides_meta.append({"file": file_name, "ms": _read_advance_ms(slide)})
 
         return slides_meta
